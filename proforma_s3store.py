@@ -5,6 +5,7 @@ import os
 import logging
 import io
 import tempfile
+import streamlit as st
 from email.header import decode_header
 import toml
 from PyPDF2 import PdfReader, errors
@@ -13,7 +14,7 @@ from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import CharacterTextSplitter
 
 # Configuration constants
-SECRETS_FILE_PATH = "C:/Users/Admin/.vscode/s3/.streamlit/secrets.toml"
+#SECRETS_FILE_PATH = "C:/Users/Admin/.vscode/s3/.streamlit/secrets.toml"
 IMAP_SERVER = "imap.gmail.com"
 S3_BUCKET = "kalika-rag"
 S3_FOLDER = "proforma_invoice/"
@@ -22,7 +23,7 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 PROCESSED_SUFFIX = "_processed"
 
 # Load secrets from secrets.toml
-secrets = toml.load(SECRETS_FILE_PATH)
+#secrets = toml.load(SECRETS_FILE_PATH)
 
 # Set up logging
 logging.basicConfig(
@@ -32,10 +33,10 @@ logging.basicConfig(
 )
 
 # Email and S3 credentials
-EMAIL_ACCOUNT = secrets["gmail_uname"]
-EMAIL_PASSWORD = secrets["gmail_pwd"]
-AWS_ACCESS_KEY = secrets["access_key_id"]
-AWS_SECRET_KEY = secrets["secret_access_key"] 
+EMAIL_ACCOUNT = st.secrets["gmail_uname"]
+EMAIL_PASSWORD = st.secrets["gmail_pwd"]
+AWS_ACCESS_KEY = st.secrets["access_key_id"]
+AWS_SECRET_KEY = st.secrets["secret_access_key"]
 
 # Initialize S3 client
 s3_client = boto3.client(
