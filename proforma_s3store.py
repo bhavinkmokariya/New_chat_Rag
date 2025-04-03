@@ -8,6 +8,7 @@ import tempfile
 import streamlit as st
 from email.header import decode_header
 import toml
+import pdfplumber
 from PyPDF2 import PdfReader, errors
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -41,8 +42,8 @@ AWS_SECRET_KEY = st.secrets["secret_access_key"]
 # Initialize S3 client
 s3_client = boto3.client(
     "s3",
-    aws_access_key_id=secrets["access_key_id"],
-    aws_secret_access_key=secrets["secret_access_key"],
+    aws_access_key_id=st.secrets["access_key_id"],
+    aws_secret_access_key=st.secrets["secret_access_key"],
 )
 
 # Initialize embeddings model
@@ -101,7 +102,6 @@ def upload_to_s3(file_content, bucket, key):
         logging.error(f"Upload failed for {key}: {e}")
         return False
 
-import pdfplumber
 
 def process_pdf_content(file_content):
     """Extract and chunk text from valid PDF bytes using pdfplumber."""
