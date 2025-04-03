@@ -1,0 +1,12 @@
+boto3
+streamlit
+faiss-cpu
+pdfplumber
+langchain
+langchain_community
+sentence-transformers
+schedule
+PyPDF2
+langchain_huggingface
+nest_asyncio
+transformers
