@@ -42,42 +42,47 @@ embeddings = HuggingFaceEmbeddings(
 
 
 def load_faiss_index_from_s3(s3_client, bucket, index_prefix):
-    """Load a FAISS index from S3 into memory."""
+    """Load a FAISS index from S3 into memory and count files."""
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             response = s3_client.list_objects_v2(Bucket=bucket, Prefix=index_prefix)
             if 'Contents' not in response:
                 logging.warning(f"No FAISS index files found at {index_prefix}")
-                return None
+                return None, 0
 
+            file_count = 0
             for obj in response['Contents']:
                 key = obj['Key']
                 file_name = os.path.basename(key)
                 local_path = os.path.join(temp_dir, file_name)
                 logging.info(f"Downloading {key} to {local_path}")
                 s3_client.download_file(bucket, key, local_path)
+                file_count += 1
 
             vector_store = FAISS.load_local(temp_dir, embeddings, allow_dangerous_deserialization=True)
-            logging.info(f"Successfully loaded FAISS index from {index_prefix}")
-            return vector_store
+            logging.info(f"Loaded FAISS index from {index_prefix} with {file_count} files")
+            return vector_store, file_count
     except Exception as e:
         logging.error(f"Failed to load FAISS index from {index_prefix}: {str(e)}")
-        return None
+        return None, 0
 
 
 def load_all_faiss_indexes(s3_client):
-    """Load all FAISS indexes from S3."""
+    """Load all FAISS indexes from S3 and return total file count."""
     index_prefixes = {
         "PO": PO_INDEX_PATH,
         "Proforma": PROFORMA_INDEX_PATH
     }
 
     loaded_indexes = {}
-    for name, prefix in index_prefixes.items():
-        vector_store = load_faiss_index_from_s3(s3_client, S3_BUCKET, prefix)
-        loaded_indexes[name] = vector_store
+    total_file_count = 0
 
-    return loaded_indexes
+    for name, prefix in index_prefixes.items():
+        vector_store, file_count = load_faiss_index_from_s3(s3_client, S3_BUCKET, prefix)
+        loaded_indexes[name] = vector_store
+        total_file_count += file_count
+
+    return loaded_indexes, total_file_count
 
 
 # Streamlit app
@@ -106,13 +111,13 @@ def cached_load_all_faiss_indexes(_s3_client):
         return load_all_faiss_indexes(_s3_client)
     except Exception as e:
         logging.error(f"Error loading FAISS indexes: {str(e)}")
-        return {}
+        return {}, 0
 
 
-# Load all FAISS indexes
-loaded_indexes = cached_load_all_faiss_indexes(s3_client)
+# Load all FAISS indexes and get total file count
+loaded_indexes, total_file_count = cached_load_all_faiss_indexes(s3_client)
 
-# Display loading status
+# Display loading status and total file count
 st.subheader("FAISS Index Loading Status")
 if not loaded_indexes:
     st.error("No FAISS indexes loaded. Check logs for details.")
@@ -122,3 +127,5 @@ else:
             st.success(f"{name} FAISS Index Loaded Successfully!")
         else:
             st.error(f"Failed to load {name} FAISS Index")
+
+st.info(f"Total FAISS Index Files Loaded: {total_file_count}")
