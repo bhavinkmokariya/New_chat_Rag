@@ -19,17 +19,17 @@ def create_s3_client():
     )
 
 
-# Function to count FAISS index files in S3
-def count_faiss_files(bucket_name, index_path):
+# Function to count FAISS index files and documents in S3
+def count_faiss_files_and_documents(bucket_name, index_path):
     """
-    Counts the number of FAISS index files in an S3 bucket under a specific path.
+    Counts the number of FAISS index files and documents in an S3 bucket under a specific path.
 
     Args:
         bucket_name (str): The name of the S3 bucket.
         index_path (str): The path to the FAISS index in the S3 bucket.
 
     Returns:
-        int: The number of files found under the specified path.
+        tuple: (int, int) - The number of FAISS index files and document count.
     """
     s3 = create_s3_client()
     try:
@@ -37,39 +37,52 @@ def count_faiss_files(bucket_name, index_path):
         pages = paginator.paginate(Bucket=bucket_name, Prefix=index_path)
 
         file_count = 0
+        document_count = 0
+
         for page in pages:
             if "Contents" in page:
-                file_count += len(page["Contents"])
+                for obj in page["Contents"]:
+                    file_count += 1
+                    if obj["Key"].endswith(".faiss"):
+                        # Extract document count from FAISS file names (assuming format includes document count)
+                        try:
+                            doc_count = int(obj["Key"].split("_")[1].split(".")[0])
+                            document_count += doc_count
+                        except (IndexError, ValueError):
+                            st.error(f"Error parsing document count from file: {obj['Key']}")
 
-        return file_count
+        return file_count, document_count
     except Exception as e:
-        st.error(f"Error counting FAISS index files: {e}")
-        return None
+        st.error(f"Error counting FAISS index files and documents: {e}")
+        return None, None
 
 
 # Streamlit UI
-st.title("FAISS Index File Counter")
+st.title("FAISS Index File and Document Counter")
 
 with st.sidebar:
     st.header("Settings")
     proforma_index_path = st.text_input("Proforma Index Path", value="faiss_indexes/proforma_faiss_index/")
     po_index_path = st.text_input("PO Index Path", value="faiss_indexes/po_faiss_index/")
 
-if st.button("Count Files"):
-    # Count files for Proforma FAISS index
-    proforma_file_count = count_faiss_files(bucket_name, proforma_index_path)
+if st.button("Count Files and Documents"):
+    # Count files and documents for Proforma FAISS index
+    proforma_file_count, proforma_document_count = count_faiss_files_and_documents(bucket_name, proforma_index_path)
 
-    # Count files for PO FAISS index
-    po_file_count = count_faiss_files(bucket_name, po_index_path)
+    # Count files and documents for PO FAISS index
+    po_file_count, po_document_count = count_faiss_files_and_documents(bucket_name, po_index_path)
 
     # Display results
-    st.header("File Counts")
+    st.header("Counts")
+
     if proforma_file_count is not None:
         st.write(f"Proforma FAISS Index File Count: {proforma_file_count}")
+        st.write(f"Proforma Document Count: {proforma_document_count}")
     else:
         st.write("Proforma FAISS Index File Count: Error occurred")
 
     if po_file_count is not None:
         st.write(f"PO FAISS Index File Count: {po_file_count}")
+        st.write(f"PO Document Count: {po_document_count}")
     else:
         st.write("PO FAISS Index File Count: Error occurred")
