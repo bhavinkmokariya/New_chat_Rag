@@ -1,3 +1,4 @@
+import streamlit as st
 import boto3
 import os
 import tempfile
@@ -96,8 +97,7 @@ if __name__ == "__main__":
     # This block is for local testing; Streamlit Cloud will use st.secrets
     import toml
 
-    secrets = toml.load(".streamlit/secrets.toml")
-    s3_client = initialize_s3_client(secrets["access_key_id"], secrets["secret_access_key"])
+    s3_client = initialize_s3_client(st.secrets["access_key_id"],st.secrets["secret_access_key"])
     po_index, po_file_count, proforma_index, proforma_file_count = load_all_indexes(s3_client)
 
     if po_index:
