@@ -4,27 +4,24 @@ import faiss
 import tempfile
 import toml
 import os
+import numpy as np
 from PO_s3store import PO_INDEX_PATH, S3_BUCKET as PO_S3_BUCKET
 from proforma_s3store import S3_PROFORMA_INDEX_PATH, S3_BUCKET as PROFORMA_S3_BUCKET
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS as LangchainFAISS
-from langchain.prompts import PromptTemplate
-from langchain_huggingface import HuggingFacePipeline
 from transformers import pipeline
 
-# Configuration constants from the provided scripts
-#SECRETS_FILE_PATH = "C:/Users/Admin/.vscode/s3/.streamlit/secrets.toml"
+# Configuration constants
+SECRETS_FILE_PATH = "C:/Users/Admin/.vscode/s3/.streamlit/secrets.toml"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # Same as in your scripts
 
 # Load secrets from secrets.toml
 try:
-    #secrets = toml.load(SECRETS_FILE_PATH)
-    AWS_ACCESS_KEY = st.secrets["access_key_id"]
-    AWS_SECRET_KEY = st.secrets["secret_access_key"]
+    secrets = toml.load(SECRETS_FILE_PATH)
+    AWS_ACCESS_KEY = secrets["access_key_id"]
+    AWS_SECRET_KEY = secrets["secret_access_key"]
 except FileNotFoundError:
     st.error("Secrets file not found. Please ensure secrets.toml is correctly configured.")
     st.stop()
-
 
 # Function to create an S3 client
 def create_s3_client():
@@ -35,11 +32,10 @@ def create_s3_client():
         aws_secret_access_key=AWS_SECRET_KEY,
     )
 
-
-# Function to download FAISS index file from S3 and load it
-def load_faiss_index(bucket_name, index_path, file_name="index.faiss"):
+# Function to download and load FAISS index directly from S3
+def load_raw_faiss_index(bucket_name, index_path, file_name="index.faiss"):
     """
-    Downloads and loads a FAISS index from S3.
+    Downloads and loads a raw FAISS index from S3.
 
     Args:
         bucket_name (str): The name of the S3 bucket.
@@ -47,86 +43,107 @@ def load_faiss_index(bucket_name, index_path, file_name="index.faiss"):
         file_name (str): The name of the FAISS index file.
 
     Returns:
-        LangchainFAISS: Loaded FAISS index, or None if an error occurs.
+        faiss.Index: Loaded FAISS index, or None if an error occurs.
     """
     s3 = create_s3_client()
     full_s3_path = f"{index_path}{file_name}"
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs={'device': 'cpu'},
-        encode_kwargs={'normalize_embeddings': False}
-    )
     try:
         s3.head_object(Bucket=bucket_name, Key=full_s3_path)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_index_path = os.path.join(temp_dir, "faiss_index")
-            os.makedirs(temp_index_path, exist_ok=True)
-            s3.download_file(bucket_name, full_s3_path, os.path.join(temp_index_path, file_name))
-            index = LangchainFAISS.load_local(temp_index_path, embeddings, allow_dangerous_deserialization=True)
+        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+            s3.download_file(bucket_name, full_s3_path, temp_file.name)
+            index = faiss.read_index(temp_file.name)
             return index
     except Exception as e:
         st.error(f"Error loading FAISS index from {full_s3_path}: {e}")
         return None
 
-
 # Function to count documents in FAISS index
 def count_documents_in_faiss(bucket_name, index_path, file_name="index.faiss"):
     """Counts the number of documents in a FAISS index."""
-    index = load_faiss_index(bucket_name, index_path, file_name)
+    index = load_raw_faiss_index(bucket_name, index_path, file_name)
     if index:
-        return index.index.ntotal
+        return index.ntotal
     return None
 
+# Function to load embeddings model
+def get_embeddings_model():
+    """Loads the embeddings model."""
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        model_kwargs={'device': 'cpu'},
+        encode_kwargs={'normalize_embeddings': False}
+    )
 
 # RAG setup
 def setup_rag_pipeline():
-    """Sets up a RAG pipeline with a lightweight Hugging Face model."""
+    """Sets up a text generation pipeline."""
     try:
-        # Use a lightweight model for text generation
-        generator = pipeline("text-generation", model="distilgpt2", max_length=100)
-        llm = HuggingFacePipeline(pipeline=generator)
-
-        # Define a simple prompt template
-        prompt_template = PromptTemplate(
-            input_variables=["context", "question"],
-            template="Based on the following context:\n{context}\n\nAnswer the question: {question}"
-        )
-        return llm, prompt_template
+        generator = pipeline("text-generation", model="distilgpt2", max_length=150)
+        return generator
     except Exception as e:
         st.error(f"Error setting up RAG pipeline: {e}")
-        return None, None
+        return None
 
-
-# Function to query the FAISS index and generate a response
-def query_rag(index, question, llm, prompt_template, k=3):
+# Function to query FAISS index and generate response
+def query_rag_raw_faiss(index, question, embeddings_model, generator, texts, k=3):
     """
-    Queries the FAISS index and generates a response using RAG.
+    Queries the raw FAISS index and generates a response.
 
     Args:
         index: Loaded FAISS index.
         question (str): User's question.
-        llm: Language model pipeline.
-        prompt_template: Prompt template for formatting.
+        embeddings_model: Embeddings model for query encoding.
+        generator: Text generation pipeline.
+        texts (list): List of original text chunks (for retrieval).
         k (int): Number of documents to retrieve.
 
     Returns:
         str: Generated response.
     """
-    if not index or not llm or not prompt_template:
+    if not index or not embeddings_model or not generator or not texts:
         return "Error: RAG components not properly initialized."
 
     try:
-        # Retrieve relevant documents
-        docs = index.similarity_search(question, k=k)
-        context = "\n".join([doc.page_content for doc in docs])
+        # Embed the question
+        question_embedding = embeddings_model.embed_query(question)
+        question_embedding = np.array([question_embedding]).astype('float32')
 
-        # Format prompt and generate response
-        prompt = prompt_template.format(context=context, question=question)
-        response = llm(prompt)
+        # Search the FAISS index
+        distances, indices = index.search(question_embedding, k)
+        if len(indices) == 0 or max(indices[0]) >= len(texts):
+            return "No relevant documents found."
+
+        # Retrieve relevant text chunks
+        context = "\n".join([texts[idx] for idx in indices[0] if idx < len(texts)])
+
+        # Generate response
+        prompt = f"Based on the following context:\n{context}\n\nAnswer the question: {question}"
+        response = generator(prompt, max_length=150, num_return_sequences=1)[0]['generated_text']
         return response
     except Exception as e:
         return f"Error generating response: {e}"
 
+# Load text chunks from S3 (simplified assumption: stored alongside index)
+def load_text_chunks(bucket_name, folder_path):
+    """
+    Loads text chunks from S3 (assumes a text file with chunks exists).
+
+    Args:
+        bucket_name (str): S3 bucket name.
+        folder_path (str): Folder path in S3.
+
+    Returns:
+        list: List of text chunks.
+    """
+    s3 = create_s3_client()
+    try:
+        # Assuming a file like 'chunks.txt' exists with one chunk per line
+        response = s3.get_object(Bucket=bucket_name, Key=f"{folder_path}chunks.txt")
+        chunks = response['Body'].read().decode('utf-8').splitlines()
+        return chunks
+    except Exception as e:
+        st.warning(f"Could not load text chunks: {e}. Using placeholder.")
+        return ["Placeholder text"]  # Fallback if no chunks file exists
 
 # Streamlit UI
 st.title("FAISS Index Document Counter & RAG Query Tool")
@@ -139,7 +156,7 @@ with st.sidebar:
     faiss_file_name = st.text_input("FAISS File Name", value="index.faiss")
     bucket_name = st.text_input("S3 Bucket Name", value=PO_S3_BUCKET)
 
-# Tabbed interface for Document Count and RAG Query
+# Tabbed interface
 tab1, tab2 = st.tabs(["Document Count", "RAG Query"])
 
 with tab1:
@@ -167,17 +184,23 @@ with tab2:
         if question:
             # Load the appropriate FAISS index
             index_path = proforma_index_path if index_type == "Proforma" else po_index_path
-            faiss_index = load_faiss_index(bucket_name, index_path, faiss_file_name)
+            folder_path = "proforma_invoice/" if index_type == "Proforma" else "PO_Dump/"
+            faiss_index = load_raw_faiss_index(bucket_name, index_path, faiss_file_name)
 
             if faiss_index:
-                # Setup RAG pipeline
-                llm, prompt_template = setup_rag_pipeline()
-                if llm and prompt_template:
-                    response = query_rag(faiss_index, question, llm, prompt_template)
+                # Load embeddings and generator
+                embeddings_model = get_embeddings_model()
+                generator = setup_rag_pipeline()
+
+                # Load text chunks (assumes a companion file exists)
+                texts = load_text_chunks(bucket_name, folder_path)
+
+                if embeddings_model and generator:
+                    response = query_rag_raw_faiss(faiss_index, question, embeddings_model, generator, texts)
                     st.write("**Answer:**")
                     st.write(response)
                 else:
-                    st.error("Failed to initialize RAG pipeline.")
+                    st.error("Failed to initialize RAG components.")
             else:
                 st.error(f"Failed to load {index_type} FAISS index.")
         else:
@@ -188,5 +211,5 @@ st.info("Note: The FAISS indices are updated daily at 12:00 AM and checked every
 st.markdown("""
 ### How to Use
 - **Document Count**: Click 'Count Documents' to see the number of indexed documents.
-- **RAG Query**: Enter a question, select an index (Proforma or PO), and click 'Get Answer' to query the documents.
+- **RAG Query**: Enter a question, select an index, and click 'Get Answer' to query the documents.
 """)
