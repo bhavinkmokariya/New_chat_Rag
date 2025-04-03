@@ -1,131 +1,107 @@
+import streamlit as st
 import boto3
 import os
 import tempfile
-import logging
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-import streamlit as st
 
-# Configuration constants
-S3_BUCKET = "kalika-rag"
-PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"
-PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/"
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Load AWS credentials and S3 details from Streamlit secrets
+aws_access_key_id = st.secrets["AWS_ACCESS_KEY_ID"]
+aws_secret_access_key = st.secrets["AWS_SECRET_ACCESS_KEY"]
+bucket_name = st.secrets["s3_bucket_name"]
+region_name = st.secrets["s3_region"]
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+# Function to create an S3 client using the provided credentials
+def create_s3_client():
+    """Creates an authenticated S3 client."""
+    return boto3.client(
+        "s3",
+        region_name=region_name,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+    )
 
+# Function to load FAISS index from S3
+def load_faiss_index_from_s3(bucket_name, index_path, embeddings):
+    """
+    Loads a FAISS index from S3.
 
-def initialize_s3_client(aws_access_key, aws_secret_key):
-    """Initialize and return an S3 client with provided credentials."""
-    try:
-        return boto3.client(
-            "s3",
-            aws_access_key_id=aws_access_key,
-            aws_secret_access_key=aws_secret_key,
-        )
-    except Exception as e:
-        logging.error(f"Failed to initialize S3 client: {str(e)}")
-        raise
+    Args:
+        bucket_name (str): The name of the S3 bucket.
+        index_path (str): The path to the FAISS index in the S3 bucket.
+        embeddings: The embeddings to use for the FAISS index.
 
-
-# Initialize embeddings model
-embeddings = HuggingFaceEmbeddings(
-    model_name=EMBEDDING_MODEL,
-    model_kwargs={'device': 'cpu'},
-    encode_kwargs={'normalize_embeddings': False}
-)
-
-
-def load_faiss_index_from_s3(s3_client, bucket, index_prefix):
-    """Load a FAISS index from S3 into memory and count files."""
+    Returns:
+        FAISS: The loaded FAISS index, or None if an error occurred.
+    """
+    s3 = create_s3_client()
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            response = s3_client.list_objects_v2(Bucket=bucket, Prefix=index_prefix)
-            if 'Contents' not in response:
-                logging.warning(f"No FAISS index files found at {index_prefix}")
-                return None, 0
+            local_index_path = os.path.join(temp_dir, "faiss_index")
+            os.makedirs(local_index_path, exist_ok=True)
 
-            file_count = 0
-            for obj in response['Contents']:
-                key = obj['Key']
-                file_name = os.path.basename(key)
-                local_path = os.path.join(temp_dir, file_name)
-                logging.info(f"Downloading {key} to {local_path}")
-                s3_client.download_file(bucket, key, local_path)
-                file_count += 1
+            # Download the index files from S3
+            paginator = s3.get_paginator("list_objects_v2")
+            pages = paginator.paginate(Bucket=bucket_name, Prefix=index_path)
+            for page in pages:
+                if "Contents" in page:
+                    for obj in page["Contents"]:
+                        file_key = obj["Key"]
+                        file_name = os.path.basename(file_key)
+                        local_file_path = os.path.join(local_index_path, file_name)
+                        s3.download_file(bucket_name, file_key, local_file_path)
 
-            vector_store = FAISS.load_local(temp_dir, embeddings)
-            logging.info(f"Loaded FAISS index from {index_prefix} with {file_count} files")
-            return vector_store, file_count
+            # Load the FAISS index from the downloaded files
+            index = FAISS.load_local(local_index_path, embeddings)
+            return index
     except Exception as e:
-        logging.error(f"Failed to load FAISS index from {index_prefix}: {str(e)}")
-        return None, 0
+        st.error(f"Error loading FAISS index from S3: {e}")
+        return None
 
+# Initialize session state for counts
+if "proforma_count" not in st.session_state:
+    st.session_state.proforma_count = None
+if "po_count" not in st.session_state:
+    st.session_state.po_count = None
 
-def load_all_faiss_indexes(s3_client):
-    """Load all FAISS indexes from S3 and return total file count."""
-    index_prefixes = {
-        "PO": PO_INDEX_PATH,
-        "Proforma": PROFORMA_INDEX_PATH
-    }
+# Sidebar for settings
+with st.sidebar:
+    st.header("Settings")
+    proforma_index_path = st.text_input("Proforma Index Path", value="faiss_indexes/proforma_faiss_index/")
+    po_index_path = st.text_input("PO Index Path", value="faiss_indexes/po_faiss_index/")
+    embedding_model_name = st.text_input("Embedding Model Name", value="sentence-transformers/all-MiniLM-L6-v2")
 
-    loaded_indexes = {}
-    total_file_count = 0
-
-    for name, prefix in index_prefixes.items():
-        vector_store, file_count = load_faiss_index_from_s3(s3_client, S3_BUCKET, prefix)
-        loaded_indexes[name] = vector_store
-        total_file_count += file_count
-
-    return loaded_indexes, total_file_count
-
-
-# Streamlit app
+# Main app
 st.title("FAISS Index Loader")
 
-# Load AWS credentials from Streamlit secrets
-try:
-    aws_access_key = st.secrets["access_key_id"]
-    aws_secret_key = st.secrets["secret_access_key"]
-except KeyError as e:
-    st.error(f"Missing secret: {e}. Please configure secrets in Streamlit Cloud.")
-    st.stop()
+# Load embeddings (move this outside the button click for efficiency)
 
-# Initialize S3 client
-try:
-    s3_client = initialize_s3_client(aws_access_key, aws_secret_key)
-except Exception as e:
-    st.error(f"Failed to initialize S3 client: {str(e)}")
-    st.stop()
+embeddings = HuggingFaceEmbeddings(model_name=embedding_model_name)
 
+# Button to load indexes and display counts
+if st.button("Load FAISS Indexes"):
+    # Load Proforma FAISS index
+    proforma_index = load_faiss_index_from_s3(bucket_name, proforma_index_path, embeddings)
+    if proforma_index:
+        st.session_state.proforma_count = proforma_index.index.ntotal
+    else:
+        st.session_state.proforma_count = None
 
-# Cache the index loading
-@st.cache_resource
-def cached_load_all_faiss_indexes(_s3_client):
-    try:
-        return load_all_faiss_indexes(_s3_client)
-    except Exception as e:
-        logging.error(f"Error loading FAISS indexes: {str(e)}")
-        return {}, 0
+    # Load PO FAISS index
+    po_index = load_faiss_index_from_s3(bucket_name, po_index_path, embeddings)
+    if po_index:
+        st.session_state.po_count = po_index.index.ntotal
+    else:
+        st.session_state.po_count = None
 
-
-# Load all FAISS indexes and get total file count
-loaded_indexes, total_file_count = cached_load_all_faiss_indexes(s3_client)
-
-# Display loading status and total file count
-st.subheader("FAISS Index Loading Status")
-if not loaded_indexes:
-    st.error("No FAISS indexes loaded. Check logs for details.")
+# Display counts
+st.header("Index Counts")
+if st.session_state.proforma_count is not None:
+    st.write(f"Proforma FAISS Index Count: {st.session_state.proforma_count}")
 else:
-    for name, vector_store in loaded_indexes.items():
-        if vector_store:
-            st.success(f"{name} FAISS Index Loaded Successfully!")
-        else:
-            st.error(f"Failed to load {name} FAISS Index")
+    st.write("Proforma FAISS Index Count: Not loaded")
 
-st.info(f"Total FAISS Index Files Loaded: {total_file_count}")
+if st.session_state.po_count is not None:
+    st.write(f"PO FAISS Index Count: {st.session_state.po_count}")
+else:
+    st.write("PO FAISS Index Count: Not loaded")
