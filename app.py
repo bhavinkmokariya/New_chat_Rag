@@ -11,14 +11,14 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from transformers import pipeline
 
 # Configuration constants
-SECRETS_FILE_PATH = "C:/Users/Admin/.vscode/s3/.streamlit/secrets.toml"
+#SECRETS_FILE_PATH = "C:/Users/Admin/.vscode/s3/.streamlit/secrets.toml"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # Same as in your scripts
 
 # Load secrets from secrets.toml
 try:
-    secrets = toml.load(SECRETS_FILE_PATH)
-    AWS_ACCESS_KEY = secrets["access_key_id"]
-    AWS_SECRET_KEY = secrets["secret_access_key"]
+    #secrets = toml.load(SECRETS_FILE_PATH)
+    AWS_ACCESS_KEY = st.secrets["access_key_id"]
+    AWS_SECRET_KEY = st.secrets["secret_access_key"]
 except FileNotFoundError:
     st.error("Secrets file not found. Please ensure secrets.toml is correctly configured.")
     st.stop()
