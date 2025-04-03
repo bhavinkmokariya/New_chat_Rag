@@ -42,51 +42,46 @@ embeddings = HuggingFaceEmbeddings(
 
 
 def load_faiss_index_from_s3(s3_client, bucket, index_prefix):
-    """Load a FAISS index from S3 and count files."""
+    """Load a FAISS index from S3 into memory."""
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             response = s3_client.list_objects_v2(Bucket=bucket, Prefix=index_prefix)
             if 'Contents' not in response:
                 logging.warning(f"No FAISS index files found at {index_prefix}")
-                return None, 0
+                return None
 
-            file_count = 0
             for obj in response['Contents']:
                 key = obj['Key']
                 file_name = os.path.basename(key)
                 local_path = os.path.join(temp_dir, file_name)
                 logging.info(f"Downloading {key} to {local_path}")
                 s3_client.download_file(bucket, key, local_path)
-                file_count += 1
 
             vector_store = FAISS.load_local(temp_dir, embeddings, allow_dangerous_deserialization=True)
-            logging.info(f"Loaded FAISS index from {index_prefix} with {file_count} files")
-            return vector_store, file_count
+            logging.info(f"Successfully loaded FAISS index from {index_prefix}")
+            return vector_store
     except Exception as e:
         logging.error(f"Failed to load FAISS index from {index_prefix}: {str(e)}")
-        return None, 0
+        return None
 
 
 def load_all_faiss_indexes(s3_client):
-    """Load all FAISS indexes from S3 and return total file count."""
+    """Load all FAISS indexes from S3."""
     index_prefixes = {
         "PO": PO_INDEX_PATH,
         "Proforma": PROFORMA_INDEX_PATH
     }
 
     loaded_indexes = {}
-    total_file_count = 0
-
     for name, prefix in index_prefixes.items():
-        vector_store, file_count = load_faiss_index_from_s3(s3_client, S3_BUCKET, prefix)
+        vector_store = load_faiss_index_from_s3(s3_client, S3_BUCKET, prefix)
         loaded_indexes[name] = vector_store
-        total_file_count += file_count
 
-    return loaded_indexes, total_file_count
+    return loaded_indexes
 
 
 # Streamlit app
-st.title("FAISS Index Loader for Sales Team")
+st.title("FAISS Index Loader")
 
 # Load AWS credentials from Streamlit secrets
 try:
@@ -108,42 +103,22 @@ except Exception as e:
 @st.cache_resource
 def cached_load_all_faiss_indexes(_s3_client):
     try:
-        result = load_all_faiss_indexes(_s3_client)
-        if result is None or not isinstance(result, tuple):
-            logging.error("load_all_faiss_indexes returned invalid result")
-            return {}, 0
-        return result
+        return load_all_faiss_indexes(_s3_client)
     except Exception as e:
-        logging.error(f"Error in cached_load_all_faiss_indexes: {str(e)}")
-        return {}, 0
+        logging.error(f"Error loading FAISS indexes: {str(e)}")
+        return {}
 
 
-# Load all FAISS indexes and get total file count
-loaded_indexes, total_file_count = cached_load_all_faiss_indexes(s3_client)
+# Load all FAISS indexes
+loaded_indexes = cached_load_all_faiss_indexes(s3_client)
 
-# Display loading status and total file count
+# Display loading status
 st.subheader("FAISS Index Loading Status")
-if not isinstance(loaded_indexes, dict):
-    st.error("Failed to load FAISS indexes: Invalid data returned. Check logs for details.")
-    loaded_indexes = {}  # Reset to empty dict to prevent AttributeError
-
-for name, vector_store in loaded_indexes.items():
-    if vector_store:
-        st.success(f"{name} FAISS Index Loaded Successfully!")
-    else:
-        st.error(f"Failed to load {name} FAISS Index")
-
-st.info(f"Total FAISS Index Files Loaded: {total_file_count}")
-
-# Optional: Test similarity search
-query = st.text_input("Enter a test query:")
-if query:
+if not loaded_indexes:
+    st.error("No FAISS indexes loaded. Check logs for details.")
+else:
     for name, vector_store in loaded_indexes.items():
         if vector_store:
-            try:
-                results = vector_store.similarity_search(query, k=3)
-                st.write(f"Top {name} Results:", results)
-            except Exception as e:
-                st.error(f"Error searching {name} index: {str(e)}")
+            st.success(f"{name} FAISS Index Loaded Successfully!")
         else:
-            st.warning(f"No {name} index available to process the query.")
+            st.error(f"Failed to load {name} FAISS Index")
