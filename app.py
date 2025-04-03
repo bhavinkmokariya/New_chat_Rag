@@ -12,7 +12,7 @@ from datetime import datetime
 
 # Configuration constants
 S3_BUCKET = "kalika-rag"
-PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/"
+PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/faiss_index_20250403-221056/"
 PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 LLM_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"  # Replace with your preferred model
