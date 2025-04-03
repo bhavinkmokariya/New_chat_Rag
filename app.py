@@ -6,8 +6,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
-from langchain_community.llms import HuggingFaceHub
-import toml
+from langchain_google_genai import GoogleGenerativeAI
 from datetime import datetime
 
 # Configuration constants
@@ -15,14 +14,13 @@ S3_BUCKET = "kalika-rag"
 PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/faiss_index_20250403-221056/"
 PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-LLM_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"  # Replace with your preferred model
 PROFORMA_FOLDER = "proforma_invoice/"
 PO_FOLDER = "PO_Dump/"
 
 # Load secrets from secrets.toml
 AWS_ACCESS_KEY = st.secrets["AWS_ACCESS_KEY_ID"]
 AWS_SECRET_KEY = st.secrets["AWS_SECRET_ACCESS_KEY"]
-HUGGINGFACE_TOKEN = st.secrets["HUGGINGFACE_ACCESS_TOKEN"]
+GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -38,12 +36,8 @@ embeddings = HuggingFaceEmbeddings(
     encode_kwargs={'normalize_embeddings': False}
 )
 
-# Initialize LLM (HuggingFace Hub)
-llm = HuggingFaceHub(
-    repo_id=LLM_MODEL,
-    huggingfacehub_api_token=HUGGINGFACE_TOKEN,
-    model_kwargs={"temperature": 0.7, "max_length": 512}
-)
+# Initialize Gemini 1.5 Pro
+llm = GoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=GOOGLE_API_KEY)
 
 # Prompt template for RAG
 prompt_template = PromptTemplate(
