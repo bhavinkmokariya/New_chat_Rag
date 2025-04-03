@@ -59,7 +59,7 @@ def load_faiss_index_from_s3(s3_client, bucket, index_prefix):
                 s3_client.download_file(bucket, key, local_path)
                 file_count += 1
 
-            vector_store = FAISS.load_local(temp_dir, embeddings, allow_dangerous_deserialization=True)
+            vector_store = FAISS.load_local(temp_dir, embeddings)
             logging.info(f"Loaded FAISS index from {index_prefix} with {file_count} files")
             return vector_store, file_count
     except Exception as e:
