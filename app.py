@@ -52,7 +52,7 @@ def load_faiss_index_from_s3(bucket_name, index_path, embeddings):
                         s3.download_file(bucket_name, file_key, local_file_path)
 
             # Load the FAISS index from the downloaded files
-            index = FAISS.load_local(local_index_path, embeddings)
+            index = FAISS.load_local(local_index_path, embeddings,allow_dangerous_deserialization=True)
             return index
     except Exception as e:
         st.error(f"Error loading FAISS index from S3: {e}")
