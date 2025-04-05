@@ -23,10 +23,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Load secrets from Streamlit Cloud (assumes secrets are set in Streamlit Cloud dashboard)
+# Load secrets from Streamlit Cloud
 AWS_ACCESS_KEY = st.secrets["access_key_id"]
 AWS_SECRET_KEY = st.secrets["secret_access_key"]
-GOOGLE_API_KEY = st.secrets["gemini_api_key"]
+GOOGLE_API_KEY = st.secrets["gemini_api_key"]  # Ensure this matches your Streamlit Cloud secret
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -49,17 +49,14 @@ llm = ChatGoogleGenerativeAI(
     temperature=0.7
 )
 
-
 def load_faiss_index_from_s3(bucket, prefix):
     """Load the latest FAISS index from S3."""
     try:
-        # List objects in the specified S3 prefix
         response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
         if 'Contents' not in response:
             logging.warning(f"No FAISS index found at {prefix}")
             return None
 
-        # Find the latest .faiss file (assuming the most recent file is desired)
         faiss_files = [obj for obj in response['Contents'] if obj['Key'].endswith('.faiss')]
         if not faiss_files:
             logging.warning(f"No .faiss files found at {prefix}")
@@ -68,18 +65,14 @@ def load_faiss_index_from_s3(bucket, prefix):
         latest_file = max(faiss_files, key=lambda x: x['LastModified'])
         faiss_key = latest_file['Key']
 
-        # Download FAISS index files to a temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:
             faiss_local_path = os.path.join(temp_dir, "faiss_index.faiss")
             pkl_local_path = os.path.join(temp_dir, "faiss_index.pkl")
 
-            # Download .faiss file
             s3_client.download_file(bucket, faiss_key, faiss_local_path)
-            # Download corresponding .pkl file (assumes it exists with the same base name)
             pkl_key = faiss_key.replace(".faiss", ".pkl")
             s3_client.download_file(bucket, pkl_key, pkl_local_path)
 
-            # Load FAISS index
             vector_store = FAISS.load_local(temp_dir, "faiss_index", embeddings, allow_dangerous_deserialization=True)
             logging.info(f"Loaded FAISS index from {faiss_key}")
             return vector_store
@@ -88,11 +81,9 @@ def load_faiss_index_from_s3(bucket, prefix):
         logging.error(f"Failed to load FAISS index from {prefix}: {str(e)}")
         return None
 
-
 def merge_vector_stores(po_store, proforma_store):
     """Merge PO and Proforma FAISS vector stores into a single store."""
     if po_store and proforma_store:
-        # Merge the two stores
         combined_store = FAISS.from_texts(
             po_store.get_texts() + proforma_store.get_texts(),
             embeddings
@@ -105,7 +96,6 @@ def merge_vector_stores(po_store, proforma_store):
         return proforma_store
     else:
         return None
-
 
 # Load and merge FAISS indexes
 po_vector_store = load_faiss_index_from_s3(S3_BUCKET, PO_INDEX_PATH)
@@ -130,7 +120,7 @@ if vector_store:
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=vector_store.as_retriever(search_kwargs={"k": 3}),  # Retrieve top 3 relevant chunks
+        retriever=vector_store.as_retriever(search_kwargs={"k": 3}),
         return_source_documents=True,
         chain_type_kwargs={"prompt": prompt}
     )
@@ -142,22 +132,18 @@ else:
 st.title("PO & Proforma Invoice Chatbot")
 st.write("Ask questions about Purchase Orders or Proforma Invoices!")
 
-# Chat input
 user_input = st.text_input("Your question:", "")
 
 if user_input:
     if qa_chain:
         try:
-            # Run the query
             result = qa_chain({"query": user_input})
             answer = result["result"]
             source_docs = result["source_documents"]
 
-            # Display the answer
             st.write("**Answer:**")
             st.write(answer)
 
-            # Display source documents (optional)
             with st.expander("Source Documents"):
                 for i, doc in enumerate(source_docs):
                     st.write(f"**Document {i + 1}:**")
@@ -168,5 +154,4 @@ if user_input:
     else:
         st.write("Sorry, I can't answer questions without a loaded FAISS index.")
 
-# Footer
 st.write("Powered by Gemini 1.5 Pro and FAISS embeddings.")
