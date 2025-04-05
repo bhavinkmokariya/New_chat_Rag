@@ -4,7 +4,6 @@ import boto3
 import os
 import logging
 import io
-import streamlit as st
 import tempfile
 from email.header import decode_header
 import toml
@@ -12,9 +11,12 @@ from PyPDF2 import PdfReader, errors
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import CharacterTextSplitter
+import time
+import faiss
+import pdfplumber
 
 # Configuration constants
-#SECRETS_FILE_PATH = "C:/Users/Admin/.vscode/s3/.streamlit/secrets.toml"
+SECRETS_FILE_PATH = "C:/Users/Admin/.vscode/s3/.streamlit/secrets.toml"
 IMAP_SERVER = "imap.gmail.com"
 S3_BUCKET = "kalika-rag"
 PO_DUMP_FOLDER = "PO_Dump/"  # Changed folder name
@@ -22,7 +24,7 @@ PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"  # New path for PO FAISS index
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Load secrets from secrets.toml
-#secrets = toml.load(SECRETS_FILE_PATH)
+secrets = toml.load(SECRETS_FILE_PATH)
 
 # Set up logging
 logging.basicConfig(
@@ -32,10 +34,10 @@ logging.basicConfig(
 )
 
 # Email and S3 credentials
-EMAIL_ACCOUNT = st.secrets["gmail_uname"]
-EMAIL_PASSWORD = st.secrets["gmail_pwd"]
-AWS_ACCESS_KEY = st.secrets["access_key_id"]
-AWS_SECRET_KEY = st.secrets["secret_access_key"]
+EMAIL_ACCOUNT = secrets["gmail_uname"]
+EMAIL_PASSWORD = secrets["gmail_pwd"]
+AWS_ACCESS_KEY = secrets["access_key_id"]
+AWS_SECRET_KEY = secrets["secret_access_key"]
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -108,16 +110,20 @@ def upload_to_s3(file_content, bucket, key):
 
 
 def process_pdf_content(file_content):
-    """Extract and chunk text from valid PDF bytes."""
+    """Extract and chunk text from valid PDF bytes using pdfplumber with enhanced error handling."""
     text = ""
     try:
-        if not is_valid_pdf(file_content):
-            raise errors.PdfReadError("Invalid PDF structure")
+        pdf_stream = io.BytesIO(file_content)
+        with pdfplumber.open(pdf_stream) as pdf:
+            for page in pdf.pages:
+                try:
+                    extracted_text = page.extract_text()
+                    if extracted_text:
+                        text += extracted_text + "\n"
+                except Exception as page_err:
+                    logging.error(f"Error extracting text from page: {page_err}")
+                    continue  # Skip to the next page
 
-        pdf_file = io.BytesIO(file_content)
-        reader = PdfReader(pdf_file)
-        for page in reader.pages:
-            text += page.extract_text() or ""
     except Exception as e:
         logging.error(f"PDF processing error: {str(e)}")
         return []
@@ -130,9 +136,6 @@ def process_pdf_content(file_content):
     )
     return text_splitter.split_text(text)
 
-
-
-
 def process_po_emails():
     """Process PO Order emails and upload Excel attachments directly to S3."""
     try:
@@ -143,9 +146,8 @@ def process_po_emails():
             # Select inbox and search for emails
             mail.select("inbox")
             status, email_ids = mail.search(
-                None, 'OR OR (SUBJECT "PO Order") (SUBJECT "Purchase Order") (SUBJECT "PO Dump")'
+                None, 'OR (SUBJECT "PO Order") (SUBJECT "Purchase Order") (SUBJECT "PO Dump")'
             )
-
 
             if status != "OK":
                 logging.warning("No emails found with matching subject")
@@ -192,8 +194,57 @@ def process_po_emails():
         logging.error(f"Email processing failed: {str(e)}")
         raise
 
+def merge_existing_indexes(s3_client, bucket, prefix, embeddings, new_chunks):
+    """
+    Merge new text chunks with existing FAISS indexes stored in S3.
+    """
+    try:
+        # List all objects in the specified S3 prefix
+        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        
+        # If there are no objects in the prefix, return a new FAISS index from the chunks
+        if 'Contents' not in response:
+            logging.info("No existing FAISS indexes found. Creating a new index.")
+            return FAISS.from_texts(new_chunks, embeddings)
+        
+        # Load existing FAISS indexes and accumulate vectors
+        existing_vectors = []
+        for obj in response['Contents']:
+            if obj['Key'].endswith('.faiss') or obj['Key'].endswith('.pkl'):
+                try:
+                    # Download the index file from S3 to a temporary location
+                    local_path = os.path.join(tempfile.gettempdir(), os.path.basename(obj['Key']))
+                    s3_client.download_file(bucket, obj['Key'], local_path)
+                    
+                    # Load the downloaded FAISS index
+                    vector_store = FAISS.load_local(os.path.dirname(local_path), os.path.splitext(os.path.basename(local_path))[0], embeddings,allow_dangerous_deserialization=True )
+                    
+                    # Extend the existing vectors with the vectors from the loaded index
+                    existing_vectors.extend(vector_store.get_texts())
+                    logging.info(f"Successfully loaded and merged index from {obj['Key']}")
+                except Exception as e:
+                    logging.error(f"Error loading index {obj['Key']}: {e}")
+                    continue
+
+        # Combine existing vectors with new chunks
+        all_chunks = existing_vectors + new_chunks
+        
+        # Create a new FAISS index from all chunks
+        if all_chunks:
+            logging.info(f"Creating a new FAISS index with {len(all_chunks)} chunks.")
+            return FAISS.from_texts(all_chunks, embeddings)
+        else:
+            logging.info("No chunks to create FAISS index from.")
+            return None
+
+    except Exception as e:
+        logging.error(f"Failed to merge existing indexes: {str(e)}")
+        return FAISS.from_texts(new_chunks, embeddings)  # Return a new index in case of failure
+
+
 def create_faiss_index_po():
-    """Create FAISS index from PDFs in S3 PO_Dump folder and upload to S3, skipping already processed files."""
+    """Create FAISS index from PDFs in S3 PO_Dump folder and upload to S3, merging with existing index and timestamping."""
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
     try:
         response = s3_client.list_objects_v2(
             Bucket=S3_BUCKET,
@@ -206,64 +257,55 @@ def create_faiss_index_po():
 
         all_chunks = []
         processed_pdfs = 0
-        uploaded_index_files = 0
 
         for obj in response['Contents']:
             key = obj['Key']
 
-            # Skip already processed PDFs (those with the processed suffix in their filename)
-            if key.endswith('.pdf') and not key.endswith('_processed.pdf'):
+            if key.endswith('.pdf'):
                 pdf_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
                 pdf_content = pdf_obj['Body'].read()
-                
                 chunks = process_pdf_content(pdf_content)
-                all_chunks.extend(chunks)
-                processed_pdfs += 1
-
-                # Mark the PDF as processed by renaming it (add '_processed' to the filename)
-                processed_key = key.replace('.pdf', '_processed.pdf')
-                s3_client.copy_object(
-                    Bucket=S3_BUCKET,
-                    CopySource={'Bucket': S3_BUCKET, 'Key': key},
-                    Key=processed_key
-                )
-                s3_client.delete_object(Bucket=S3_BUCKET, Key=key)
-                logging.info(f"Marked PDF as processed: {processed_key}")
+                if chunks:
+                    all_chunks.extend(chunks)
+                    processed_pdfs += 1
+                    logging.info(f"Processed PDF: {key}")
 
         if not all_chunks:
             logging.info("No valid text chunks extracted from PDFs")
             return
-
-        # Create FAISS index
-        vector_store = FAISS.from_texts(all_chunks, embeddings)
         
+        # Merge new chunks with existing indexes
+        vector_store = merge_existing_indexes(s3_client, S3_BUCKET, PO_INDEX_PATH, embeddings, all_chunks)
+
+        if not vector_store:
+            logging.info("No vector store created.")
+            return
+        
+        # Save FAISS index to a timestamped directory in S3
         with tempfile.TemporaryDirectory() as temp_dir:
             index_path = os.path.join(temp_dir, "faiss_index")
             vector_store.save_local(index_path)
             
+            # Upload each file in the index directory to S3 with a timestamped prefix
             for file_name in os.listdir(index_path):
                 local_file = os.path.join(index_path, file_name)
-                s3_key = f"{PO_INDEX_PATH}{file_name}"  # Store under faiss_indexes/po_faiss_index/
-
+                s3_key = f"{PO_INDEX_PATH}{file_name}"
+                
                 with open(local_file, 'rb') as f:
                     s3_client.put_object(
                         Bucket=S3_BUCKET,
                         Key=s3_key,
                         Body=f
                     )
-                    uploaded_index_files += 1
-                logging.info(f"Uploaded FAISS index file: {s3_key}")
+                    logging.info(f"Uploaded FAISS index file: {s3_key}")
 
-        logging.info(f"FAISS index creation and upload completed successfully. "
-                     f"Processed {processed_pdfs} new PDFs, uploaded {uploaded_index_files} index files to S3.")
+        logging.info(f"FAISS index creation completed successfully. "
+                     f"Processed {processed_pdfs} PDFs. "
+                     f"Uploaded index to S3 at {PO_INDEX_PATH}")
 
     except Exception as e:
         logging.error(f"FAISS index creation failed: {str(e)}")
-        raise
-
 
 if __name__ == "__main__":
     process_po_emails()  # Fetch PO PDFs from emails
     create_faiss_index_po()  # Create FAISS index for PO PDFs
-
-
