@@ -20,12 +20,21 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Initialize embeddings model
-embeddings = HuggingFaceEmbeddings(
-    model_name=EMBEDDING_MODEL,
-    model_kwargs={'device': 'cpu'},
-    encode_kwargs={'normalize_embeddings': False}
-)
+
+# Initialize embeddings model with Hugging Face token
+def init_embeddings():
+    try:
+        embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': False},
+            huggingfacehub_api_token=st.secrets["huggingface_token"]
+        )
+        return embeddings
+    except Exception as e:
+        logging.error(f"Failed to initialize embeddings: {str(e)}")
+        st.error("Failed to initialize embeddings. Please check your Hugging Face token.")
+        return None
 
 
 # Initialize S3 client using Streamlit secrets
@@ -55,8 +64,8 @@ def init_gemini():
         return None
 
 
-# Load FAISS index from S3 and calculate size
-def load_faiss_index_from_s3(s3_client):
+# Load FAISS index from S3
+def load_faiss_index_from_s3(s3_client, embeddings):
     try:
         response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_PROFORMA_INDEX_PATH)
 
@@ -65,25 +74,11 @@ def load_faiss_index_from_s3(s3_client):
             return None
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            total_size = 0
             for obj in response['Contents']:
                 key = obj['Key']
                 local_path = os.path.join(temp_dir, os.path.basename(key))
                 s3_client.download_file(S3_BUCKET, key, local_path)
-                file_size = os.path.getsize(local_path)  # Get size in bytes
-                total_size += file_size
-                logging.info(f"Downloaded FAISS file: {key} ({file_size / 1024:.2f} KB)")
-
-            # Convert total size to human-readable format
-            if total_size < 1024:
-                size_str = f"{total_size} bytes"
-            elif total_size < 1024 * 1024:
-                size_str = f"{total_size / 1024:.2f} KB"
-            else:
-                size_str = f"{total_size / (1024 * 1024):.2f} MB"
-
-            st.write(f"Total size of FAISS index being loaded: {size_str}")
-            logging.info(f"Total FAISS index size: {size_str}")
+                logging.info(f"Downloaded FAISS file: {key}")
 
             vector_store = FAISS.load_local(temp_dir, embeddings, allow_dangerous_deserialization=True)
             logging.info("Successfully loaded FAISS index from S3")
@@ -94,31 +89,29 @@ def load_faiss_index_from_s3(s3_client):
         return None
 
 
-# Query the FAISS index with adjustable k value
-def query_faiss_index(vector_store, query, k=1000):
+# Query the FAISS index
+def query_faiss_index(vector_store, query, k=3):
     try:
         results = vector_store.similarity_search(query, k=k)
-        logging.info(f"Retrieved {len(results)} documents from FAISS index")
         return results
     except Exception as e:
         logging.error(f"Error querying FAISS index: {str(e)}")
         return None
 
 
-# Generate response using Gemini
-def generate_response(model, query, faiss_results):
+# Generate response using Gemini tailored for sales team
+def generate_sales_response(model, query, faiss_results):
     try:
         if not faiss_results:
-            return "No relevant information found in the proforma invoices."
+            return "No relevant information found in the proforma invoices for the sales team."
 
         # Combine FAISS results into a context
         context = "\n\n".join([result.page_content for result in faiss_results])
-
-        # Log the number of tokens/characters being sent to Gemini
-        context_length = len(context)
-        logging.info(f"Context size: ~{context_length} characters from {len(faiss_results)} documents")
-
-        prompt = f"Based on the following information from proforma invoices:\n\n{context}\n\nAnswer the query: {query}"
+        prompt = (
+            f"You are assisting a sales team. Based on the following information from proforma invoices:\n\n"
+            f"{context}\n\n"
+            f"Provide a concise, sales-focused answer to the query: {query}"
+        )
 
         response = model.generate_content(prompt)
         return response.text
@@ -129,79 +122,46 @@ def generate_response(model, query, faiss_results):
 
 # Main chatbot interface
 def main():
-    st.title("Proforma Invoice Chatbot with Gemini")
+    st.title("Sales Team Proforma Invoice Chatbot")
 
-    # Initialize S3 client and Gemini model
+    # Initialize components
+    embeddings = init_embeddings()
     s3_client = init_s3_client()
     gemini_model = init_gemini()
     vector_store = None
 
-    if s3_client:
-        with st.spinner("Loading FAISS index from S3..."):
-            vector_store = load_faiss_index_from_s3(s3_client)
-
-        if vector_store:
-            st.success("FAISS index successfully loaded from S3!")
-            st.write(f"FAISS index is loaded from: s3://{S3_BUCKET}/{S3_PROFORMA_INDEX_PATH}")
-        else:
-            st.error("No FAISS index found in S3 or failed to load the index.")
-            return
-
-    if not gemini_model:
+    if not all([embeddings, s3_client, gemini_model]):
         return
 
-    # Add sidebar for advanced settings
-    with st.sidebar:
-        st.header("Search Settings")
+    # Load FAISS index
+    with st.spinner("Loading FAISS index from S3..."):
+        vector_store = load_faiss_index_from_s3(s3_client, embeddings)
 
-        # Add a slider for k value (number of documents to retrieve)
-        k_value = st.slider(
-            "Number of documents to search (k)",
-            min_value=1,
-            max_value=100,
-            value=10,
-            help="Higher values retrieve more documents but may include less relevant information"
-        )
-
-        st.info(
-            "Recommended settings:\n"
-            "- For specific questions: 3-5 documents\n"
-            "- For broader questions: 10-20 documents\n"
-            "- For comprehensive analysis: 50+ documents"
-        )
+    if vector_store:
+        st.success("FAISS index successfully loaded from S3!")
+        st.write(f"FAISS index is loaded from: s3://{S3_BUCKET}/{S3_PROFORMA_INDEX_PATH}")
+    else:
+        st.error("No FAISS index found in S3 or failed to load the index.")
+        return
 
     # Query input and response
-    if vector_store:
-        st.subheader("Ask a Question")
-        query = st.text_input("Enter your query about the proforma invoices:")
+    st.subheader("Sales Team Query")
+    query = st.text_input(
+        "Enter your sales-related query about the proforma invoices (e.g., 'What is the total amount?', 'Who is the client?'):")
 
-        if st.button("Submit"):
-            if query:
-                with st.spinner(f"Searching across {k_value} documents and generating response..."):
-                    # Search FAISS index with custom k value
-                    faiss_results = query_faiss_index(vector_store, query, k=k_value)
+    if st.button("Submit"):
+        if query:
+            with st.spinner("Searching and generating sales-focused response..."):
+                # Search FAISS index
+                faiss_results = query_faiss_index(vector_store, query)
 
-                    # Generate response with Gemini
-                    response = generate_response(gemini_model, query, faiss_results)
+                # Generate sales-focused response with Gemini
+                response = generate_sales_response(gemini_model, query, faiss_results)
 
-                st.subheader("Response")
-                st.write(response)
-
-                # Show information about the search
-                st.subheader("Search Details")
-                st.write(f"Retrieved {len(faiss_results) if faiss_results else 0} documents for this query")
-
-                # Optionally show the documents that were used
-                with st.expander("View documents used for this response"):
-                    if faiss_results:
-                        for i, doc in enumerate(faiss_results):
-                            st.markdown(f"**Document {i + 1}**")
-                            st.text(doc.page_content)
-                            st.divider()
-                    else:
-                        st.write("No documents retrieved")
-            else:
-                st.warning("Please enter a query.")
+            st.subheader("Sales Team Response")
+            st.write(response)
+        else:
+            st.warning("Please enter a query.")
 
 
 if __name__ == "__main__":
