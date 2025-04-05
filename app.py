@@ -94,16 +94,11 @@ def load_faiss_index_from_s3(s3_client):
         return None
 
 
-# Query the FAISS index
-def query_faiss_index(vector_store, query, k=None):
+# Query the FAISS index with adjustable k value
+def query_faiss_index(vector_store, query, k=3):
     try:
-        # If k is None, get the total number of documents in the index
-        if k is None:
-            # This is an approximation - FAISS doesn't have a direct way to count entries
-            # You might need to implement this differently based on your setup
-            k = 1000  # Set to a very large number to approximate "all" documents
-
         results = vector_store.similarity_search(query, k=k)
+        logging.info(f"Retrieved {len(results)} documents from FAISS index")
         return results
     except Exception as e:
         logging.error(f"Error querying FAISS index: {str(e)}")
@@ -118,6 +113,11 @@ def generate_response(model, query, faiss_results):
 
         # Combine FAISS results into a context
         context = "\n\n".join([result.page_content for result in faiss_results])
+
+        # Log the number of tokens/characters being sent to Gemini
+        context_length = len(context)
+        logging.info(f"Context size: ~{context_length} characters from {len(faiss_results)} documents")
+
         prompt = f"Based on the following information from proforma invoices:\n\n{context}\n\nAnswer the query: {query}"
 
         response = model.generate_content(prompt)
@@ -150,6 +150,26 @@ def main():
     if not gemini_model:
         return
 
+    # Add sidebar for advanced settings
+    with st.sidebar:
+        st.header("Search Settings")
+
+        # Add a slider for k value (number of documents to retrieve)
+        k_value = st.slider(
+            "Number of documents to search (k)",
+            min_value=1,
+            max_value=100,
+            value=10,
+            help="Higher values retrieve more documents but may include less relevant information"
+        )
+
+        st.info(
+            "Recommended settings:\n"
+            "- For specific questions: 3-5 documents\n"
+            "- For broader questions: 10-20 documents\n"
+            "- For comprehensive analysis: 50+ documents"
+        )
+
     # Query input and response
     if vector_store:
         st.subheader("Ask a Question")
@@ -157,15 +177,29 @@ def main():
 
         if st.button("Submit"):
             if query:
-                with st.spinner("Searching and generating response..."):
-                    # Search FAISS index
-                    faiss_results = query_faiss_index(vector_store, query)
+                with st.spinner(f"Searching across {k_value} documents and generating response..."):
+                    # Search FAISS index with custom k value
+                    faiss_results = query_faiss_index(vector_store, query, k=k_value)
 
                     # Generate response with Gemini
-                    response = generate_response(gemini_model, query, faiss_results,k=None)
+                    response = generate_response(gemini_model, query, faiss_results)
 
                 st.subheader("Response")
                 st.write(response)
+
+                # Show information about the search
+                st.subheader("Search Details")
+                st.write(f"Retrieved {len(faiss_results) if faiss_results else 0} documents for this query")
+
+                # Optionally show the documents that were used
+                with st.expander("View documents used for this response"):
+                    if faiss_results:
+                        for i, doc in enumerate(faiss_results):
+                            st.markdown(f"**Document {i + 1}**")
+                            st.text(doc.page_content)
+                            st.divider()
+                    else:
+                        st.write("No documents retrieved")
             else:
                 st.warning("Please enter a query.")
 
