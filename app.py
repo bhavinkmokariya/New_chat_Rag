@@ -95,7 +95,7 @@ def load_faiss_index_from_s3(s3_client):
 
 
 # Query the FAISS index
-def query_faiss_index(vector_store, query, k=50):
+def query_faiss_index(vector_store, query, k=3):
     try:
         results = vector_store.similarity_search(query, k=k)
         return results
