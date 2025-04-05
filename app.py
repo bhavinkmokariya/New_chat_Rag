@@ -26,7 +26,7 @@ logging.basicConfig(
 # Load secrets from Streamlit Cloud (assumes secrets are set in Streamlit Cloud dashboard)
 AWS_ACCESS_KEY = st.secrets["access_key_id"]
 AWS_SECRET_KEY = st.secrets["secret_access_key"]
-GOOGLE_API_KEY = st.secrets["google_api_key"]
+GOOGLE_API_KEY = st.secrets["gemini_api_key"]
 
 # Initialize S3 client
 s3_client = boto3.client(
