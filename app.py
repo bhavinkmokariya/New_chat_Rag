@@ -55,7 +55,7 @@ def init_gemini():
         return None
 
 
-# Load FAISS index from S3
+# Load FAISS index from S3 and calculate size
 def load_faiss_index_from_s3(s3_client):
     try:
         response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_PROFORMA_INDEX_PATH)
@@ -65,11 +65,25 @@ def load_faiss_index_from_s3(s3_client):
             return None
 
         with tempfile.TemporaryDirectory() as temp_dir:
+            total_size = 0
             for obj in response['Contents']:
                 key = obj['Key']
                 local_path = os.path.join(temp_dir, os.path.basename(key))
                 s3_client.download_file(S3_BUCKET, key, local_path)
-                logging.info(f"Downloaded FAISS file: {key}")
+                file_size = os.path.getsize(local_path)  # Get size in bytes
+                total_size += file_size
+                logging.info(f"Downloaded FAISS file: {key} ({file_size / 1024:.2f} KB)")
+
+            # Convert total size to human-readable format
+            if total_size < 1024:
+                size_str = f"{total_size} bytes"
+            elif total_size < 1024 * 1024:
+                size_str = f"{total_size / 1024:.2f} KB"
+            else:
+                size_str = f"{total_size / (1024 * 1024):.2f} MB"
+
+            st.write(f"Total size of FAISS index being loaded: {size_str}")
+            logging.info(f"Total FAISS index size: {size_str}")
 
             vector_store = FAISS.load_local(temp_dir, embeddings, allow_dangerous_deserialization=True)
             logging.info("Successfully loaded FAISS index from S3")
