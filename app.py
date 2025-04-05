@@ -1,188 +1,150 @@
-import streamlit as st
-import boto3
 import os
+import logging
+import boto3
 import tempfile
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.prompts import PromptTemplate
-from langchain.chains import RetrievalQA
-from langchain_google_genai import GoogleGenerativeAI
-from datetime import datetime
+import toml
+import google.generativeai as genai
+from typing import List, Optional
+import streamlit as st
 
 # Configuration constants
+#SECRETS_FILE_PATH = "C:/Users/Admin/.vscode/s3/.streamlit/secrets.toml"
 S3_BUCKET = "kalika-rag"
-PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/faiss_index_20250403-221056/"
-PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 PROFORMA_FOLDER = "proforma_invoice/"
 PO_FOLDER = "PO_Dump/"
+PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/"
+PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+GEMINI_API_KEY = "AIzaSyBdE-BuXNESWGaXEQDZ5gJxgRqlyzchltM"  # Replace with your actual Gemini API key
 
-# Load secrets from secrets.toml
-AWS_ACCESS_KEY = st.secrets["AWS_ACCESS_KEY_ID"]
-AWS_SECRET_KEY = st.secrets["AWS_SECRET_ACCESS_KEY"]
-GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+# Load secrets
+#secrets = toml.load(SECRETS_FILE_PATH)
+
+# Configure Gemini API
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 
 # Initialize S3 client
 s3_client = boto3.client(
     "s3",
-    aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY,
+    aws_access_key_id=st.secrets["access_key_id"],
+    aws_secret_access_key=st.secrets["secret_access_key"],
 )
 
-# Initialize embeddings
+# Initialize embeddings model
 embeddings = HuggingFaceEmbeddings(
     model_name=EMBEDDING_MODEL,
     model_kwargs={'device': 'cpu'},
     encode_kwargs={'normalize_embeddings': False}
 )
 
-# Initialize Gemini 1.5 Pro
-llm = GoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=GOOGLE_API_KEY)
 
-# Prompt template for RAG
-prompt_template = PromptTemplate(
-    input_variables=["context", "question"],
-    template="""
-    You are a helpful assistant. Use the following context to answer the user's question accurately and concisely.
-    Context: {context}
-    Question: {question}
-    Answer:
-    """
-)
+class SalesChatbot:
+    def __init__(self):
+        self.proforma_index = self.load_faiss_index(PROFORMA_INDEX_PATH)
+        self.po_index = self.load_faiss_index(PO_INDEX_PATH)
+        # Initialize Gemini 1.5 Pro model
+        self.gemini_model = genai.GenerativeModel('gemini-1.5-pro')
 
-# Function to load FAISS index from S3
-def load_faiss_index_from_s3(index_path):
-    with tempfile.TemporaryDirectory() as temp_dir:
-        for file_name in ["index.faiss", "index.pkl"]:
-            s3_key = f"{index_path}{file_name}"
-            local_path = os.path.join(temp_dir, file_name)
-            s3_client.download_file(S3_BUCKET, s3_key, local_path)
-        vector_store = FAISS.load_local(temp_dir, embeddings, allow_dangerous_deserialization=True)
-    return vector_store
+    def load_faiss_index(self, s3_prefix: str) -> Optional[FAISS]:
+        """Load the latest FAISS index from S3."""
+        try:
+            response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=s3_prefix)
+            if 'Contents' not in response:
+                logging.warning(f"No FAISS index found at {s3_prefix}")
+                return None
 
-# Function to count new files in S3 folder
-def count_new_files(folder_prefix):
-    response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=folder_prefix)
-    if 'Contents' not in response:
-        return 0
-    new_files = sum(1 for obj in response['Contents'] if not obj['Key'].endswith('_processed.pdf'))
-    return new_files
+            # Download the latest index files
+            with tempfile.TemporaryDirectory() as temp_dir:
+                for obj in response['Contents']:
+                    if obj['Key'].endswith('.faiss') or obj['Key'].endswith('.pkl'):
+                        local_path = os.path.join(temp_dir, os.path.basename(obj['Key']))
+                        s3_client.download_file(S3_BUCKET, obj['Key'], local_path)
 
-# Main Streamlit app
-def main():
-    st.set_page_config(page_title="RAG Chatbot", layout="wide")
+                # Load FAISS index
+                index = FAISS.load_local(temp_dir, "faiss_index", embeddings, allow_dangerous_deserialization=True)
+                logging.info(f"Loaded FAISS index from {s3_prefix}")
+                return index
+        except Exception as e:
+            logging.error(f"Failed to load FAISS index from {s3_prefix}: {str(e)}")
+            return None
 
-    # Custom CSS for black theme
-    st.markdown("""
-        <style>
-        /* General page styling */
-        .stApp {
-            background-color: #1E1E1E;
-            color: #E0E0E0;
-        }
-        /* Chat message styling */
-        .chat-message {
-            padding: 12px;
-            border-radius: 8px;
-            margin: 8px 0;
-            font-size: 16px;
-        }
-        .user-message {
-            background-color: #2D2D2D;
-            color: #BB86FC;
-            text-align: right;
-            border: 1px solid #BB86FC;
-        }
-        .bot-message {
-            background-color: #333333;
-            color: #E0E0E0;
-            text-align: left;
-            border: 1px solid #03DAC6;
-        }
-        /* Sidebar styling */
-        .sidebar .sidebar-content {
-            background-color: #252525;
-            padding: 20px;
-            color: #E0E0E0;
-        }
-        /* Input field */
-        .stTextInput > div > div > input {
-            background-color: #333333;
-            color: #E0E0E0;
-            border: 1px solid #555555;
-            border-radius: 5px;
-        }
-        /* Button styling */
-        .stButton > button {
-            background-color: #BB86FC;
-            color: #1E1E1E;
-            border: none;
-            border-radius: 5px;
-        }
-        .stButton > button:hover {
-            background-color: #03DAC6;
-            color: #1E1E1E;
-        }
-        /* Titles and headers */
-        h1, h2, h3 {
-            color: #BB86FC;
-        }
-        /* Spinner text */
-        .stSpinner > div > div {
-            color: #03DAC6;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-
-    # Sidebar for options and stats
-    with st.sidebar:
-        st.title("Chatbot Options")
-        option = st.radio("Select Data Source", ("Proforma Invoices", "Purchase Orders"))
-        st.subheader("New Files Processed")
-        proforma_new = count_new_files(PROFORMA_FOLDER)
-        po_new = count_new_files(PO_FOLDER)
-        st.write(f"Proforma Invoices: {proforma_new} new files")
-        st.write(f"Purchase Orders: {po_new} new files")
-        st.write(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # Chat interface
-    st.title("RAG Chatbot")
-    st.write("Ask anything based on the selected data source!")
-
-    # Initialize session state for chat history
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    if "current_option" not in st.session_state:
-        st.session_state.current_option = None
-
-    # Load FAISS index based on selected option
-    if option != st.session_state.current_option:
-        st.session_state.current_option = option
-        index_path = PROFORMA_INDEX_PATH if option == "Proforma Invoices" else PO_INDEX_PATH
-        with st.spinner(f"Loading {option} FAISS index from S3..."):
-            vector_store = load_faiss_index_from_s3(index_path)
-            retriever = vector_store.as_retriever(search_kwargs={"k": 3})
-            st.session_state.qa_chain = RetrievalQA.from_chain_type(
-                llm=llm,
-                chain_type="stuff",
-                retriever=retriever,
-                chain_type_kwargs={"prompt": prompt_template}
+    def query_gemini(self, prompt: str) -> str:
+        """Call Gemini 1.5 Pro to generate a response."""
+        try:
+            response = self.gemini_model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=500
+                )
             )
+            return response.text
+        except Exception as e:
+            logging.error(f"Gemini API error: {str(e)}")
+            return "Error: Could not connect to Gemini API."
 
-    # Chat input
-    user_input = st.text_input("Your Question:", key="input", placeholder="Type your question here...")
-    if st.button("Send") and user_input:
-        with st.spinner("Generating response..."):
-            response = st.session_state.qa_chain.run(user_input)
-            st.session_state.chat_history.append(("user", user_input))
-            st.session_state.chat_history.append(("bot", response))
+    def search_documents(self, query: str, index_type: str) -> List[str]:
+        """Search FAISS index for relevant document chunks."""
+        index = self.proforma_index if index_type == "proforma" else self.po_index
+        if not index:
+            return [f"No {index_type} index available."]
 
-    # Display chat history
-    for sender, message in st.session_state.chat_history:
-        if sender == "user":
-            st.markdown(f'<div class="chat-message user-message">{message}</div>', unsafe_allow_html=True)
+        try:
+            results = index.similarity_search(query, k=3)  # Top 3 matches
+            return [doc.page_content for doc in results]
+        except Exception as e:
+            logging.error(f"Error searching {index_type} index: {str(e)}")
+            return ["Error during search."]
+
+    def process_query(self, user_input: str) -> str:
+        """Process user query and return a response."""
+        user_input = user_input.lower()
+
+        # Determine intent and document type
+        if "proforma" in user_input or "invoice" in user_input:
+            doc_type = "proforma"
+            search_results = self.search_documents(user_input, "proforma")
+        elif "po" in user_input or "purchase order" in user_input:
+            doc_type = "po"
+            search_results = self.search_documents(user_input, "po")
         else:
-            st.markdown(f'<div class="chat-message bot-message">{message}</div>', unsafe_allow_html=True)
+            # Use Gemini to interpret ambiguous queries
+            prompt = f"Determine if the following query is about Proforma Invoices or Purchase Orders: '{user_input}'. Respond with 'proforma' or 'po'."
+            doc_type = self.query_gemini(prompt).strip()
+            search_results = self.search_documents(user_input, doc_type)
+
+        # Construct a prompt for Gemini to generate a natural response
+        context = "\n".join(search_results)
+        prompt = (
+            f"You are a helpful assistant for a sales team. Based on the following document excerpts, "
+            f"answer the query: '{user_input}'. If the information is insufficient, say so.\n\n"
+            f"Document excerpts:\n{context}"
+        )
+        response = self.query_gemini(prompt)
+        return response
+
+
+def main():
+    chatbot = SalesChatbot()
+    print("Sales Chatbot: How can I assist you today? (Type 'exit' to quit)")
+
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() == "exit":
+            print("Sales Chatbot: Goodbye.")
+            break
+
+        response = chatbot.process_query(user_input)
+        print(f"Sales Chatbot: {response}")
+
 
 if __name__ == "__main__":
     main()
