@@ -10,7 +10,7 @@ from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
 
 # Configuration constants
-S3_BUCKET = "kalika-rag"
+S3_BUCKET = st.secrets["S3_BUCKET_NAME"]
 PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"
 PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
