@@ -1,16 +1,14 @@
+import streamlit as st
 import boto3
 import os
 import logging
 import tempfile
-import streamlit as st
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-import toml
 
 # Configuration constants
 S3_BUCKET = "kalika-rag"
-PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"  # Path for PO FAISS index
-PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/"  # Path for Proforma FAISS index
+S3_PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Set up logging
@@ -18,22 +16,6 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
-)
-
-# Load secrets from Streamlit Cloud (assumes secrets are available in st.secrets)
-try:
-    AWS_ACCESS_KEY = st.secrets["access_key_id"]
-    AWS_SECRET_KEY = st.secrets["secret_access_key"]
-except KeyError as e:
-    logging.error(f"Missing secret: {e}")
-    st.error(f"Missing secret: {e}. Please ensure credentials are set in Streamlit Cloud secrets.")
-    st.stop()
-
-# Initialize S3 client
-s3_client = boto3.client(
-    "s3",
-    aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY,
 )
 
 # Initialize embeddings model
@@ -44,62 +26,68 @@ embeddings = HuggingFaceEmbeddings(
 )
 
 
-def load_faiss_index_from_s3(bucket, prefix):
-    """Load FAISS index from S3."""
+# Initialize S3 client using Streamlit secrets
+def init_s3_client():
     try:
-        # List objects in the specified S3 prefix
-        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
-
-        if 'Contents' not in response:
-            logging.warning(f"No FAISS index files found in S3 at {prefix}")
-            return None
-
-        # Use a temporary directory to download and load the index
-        with tempfile.TemporaryDirectory() as temp_dir:
-            index_files = [obj['Key'] for obj in response['Contents'] if obj['Key'].endswith(('.faiss', '.pkl'))]
-            if not index_files:
-                logging.warning(f"No valid FAISS index files (.faiss or .pkl) found in {prefix}")
-                return None
-
-            # Download all index-related files
-            for s3_key in index_files:
-                local_path = os.path.join(temp_dir, os.path.basename(s3_key))
-                s3_client.download_file(bucket, s3_key, local_path)
-                logging.info(f"Downloaded {s3_key} to {local_path}")
-
-            # Load the FAISS index
-            index_name = os.path.splitext(os.path.basename(index_files[0]))[0]  # Assume first file name as base
-            vector_store = FAISS.load_local(temp_dir, index_name, embeddings, allow_dangerous_deserialization=True)
-            logging.info(f"Successfully loaded FAISS index from S3 at {prefix}")
-            return vector_store
-
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=st.secrets["access_key_id"],
+            aws_secret_access_key=st.secrets["secret_access_key"],
+        )
+        return s3_client
     except Exception as e:
-        logging.error(f"Failed to load FAISS index from S3 at {prefix}: {str(e)}")
+        logging.error(f"Failed to initialize S3 client: {str(e)}")
+        st.error("Failed to connect to S3. Please check your credentials.")
         return None
 
 
+# Load FAISS index from S3
+def load_faiss_index_from_s3(s3_client):
+    try:
+        # List objects in the S3 index path
+        response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_PROFORMA_INDEX_PATH)
+
+        if 'Contents' not in response:
+            logging.warning("No FAISS index found in S3.")
+            return None
+
+        # Create temporary directory to store downloaded index files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Download all FAISS index files
+            for obj in response['Contents']:
+                key = obj['Key']
+                local_path = os.path.join(temp_dir, os.path.basename(key))
+                s3_client.download_file(S3_BUCKET, key, local_path)
+                logging.info(f"Downloaded FAISS file: {key}")
+
+            # Load the FAISS index
+            vector_store = FAISS.load_local(temp_dir, embeddings, allow_dangerous_deserialization=True)
+            logging.info("Successfully loaded FAISS index from S3")
+            return vector_store
+
+    except Exception as e:
+        logging.error(f"Failed to load FAISS index from S3: {str(e)}")
+        return None
+
+
+# Main chatbot interface
 def main():
-    st.title("FAISS Index Chatbot")
+    st.title("FAISS Index Loader Chatbot")
 
-    # Select which index to load
-    index_type = st.selectbox("Select FAISS Index to Load", ["PO Index", "Proforma Index"])
-    index_path = PO_INDEX_PATH if index_type == "PO Index" else PROFORMA_INDEX_PATH
+    # Initialize S3 client
+    s3_client = init_s3_client()
 
-    if st.button("Load FAISS Index"):
+    if s3_client:
+        # Load FAISS index
         with st.spinner("Loading FAISS index from S3..."):
-            vector_store = load_faiss_index_from_s3(S3_BUCKET, index_path)
+            vector_store = load_faiss_index_from_s3(s3_client)
 
+        # Display result
         if vector_store:
-            st.success(f"FAISS index successfully loaded from S3 at {index_path}!")
-            # Optionally store the vector_store in session state for further use
-            st.session_state['vector_store'] = vector_store
+            st.success("FAISS index successfully loaded from S3!")
+            st.write(f"FAISS index is loaded from: s3://{S3_BUCKET}/{S3_PROFORMA_INDEX_PATH}")
         else:
-            st.error(f"Failed to load FAISS index from S3 at {index_path}. Check logs for details.")
-
-    # Placeholder for future chatbot interaction
-    if 'vector_store' in st.session_state:
-        st.write("FAISS index is loaded and ready for querying!")
-        # Add your chatbot query logic here in future iterations
+            st.error("No FAISS index found in S3 or failed to load the index.")
 
 
 if __name__ == "__main__":
