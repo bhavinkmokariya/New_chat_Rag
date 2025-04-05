@@ -1,192 +1,172 @@
-import os
 import streamlit as st
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS  # Updated import
-from langchain.chains import RetrievalQA
+import boto3
+import os
+import tempfile
+import logging
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
-import logging
-import boto3
-from botocore.exceptions import ClientError
-import tempfile
+from langchain.chains import RetrievalQA
 
-# --- Logging Setup ---
+# Configuration constants
+S3_BUCKET = "kalika-rag"
+PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"
+PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+GOOGLE_MODEL = "gemini-1.5-pro"
+
+# Set up logging
 logging.basicConfig(
-    filename='sales_rag.log',
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger("sales_rag")
 
-# --- Configuration ---
-CONFIG = {
-    "embeddings_model": "sentence-transformers/all-MiniLM-L6-v2",
-    "faiss_paths": {
-        "po": "s3://kalika-rag/faiss_indexes/po_faiss_index/",  # Full S3 path to PO FAISS index
-        "proforma": "s3://kalika-rag/faiss_indexes/proforma_faiss_index/"  # Full S3 path to Proforma FAISS index
-    },
-    "google_model": st.secrets["gemini_api_key"],  # Gemini model name from secrets
-    "query_enhancements": {
-        "po": ["include shipment terms", "reference PO number", "note delivery address"],
-        "proforma": ["include pricing terms", "reference payment conditions", "note delivery timelines"]
-    }
-}
+# Load secrets from Streamlit Cloud (assumes secrets are set in Streamlit Cloud dashboard)
+AWS_ACCESS_KEY = st.secrets["access_key_id"]
+AWS_SECRET_KEY = st.secrets["secret_access_key"]
+GOOGLE_API_KEY = st.secrets["google_api_key"]
 
-# --- Document Type Detection ---
-def detect_document_type(query):
-    """Route queries to appropriate FAISS index"""
-    po_keywords = {'po', 'purchase order', 'shipment'}
-    proforma_keywords = {'proforma', 'invoice', 'payment'}
+# Initialize S3 client
+s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+)
 
-    query_lower = query.lower()
-    if any(kw in query_lower for kw in po_keywords):
-        return 'po'
-    elif any(kw in query_lower for kw in proforma_keywords):
-        return 'proforma'
-    return 'general'
+# Initialize embeddings model
+embeddings = HuggingFaceEmbeddings(
+    model_name=EMBEDDING_MODEL,
+    model_kwargs={'device': 'cpu'},
+    encode_kwargs={'normalize_embeddings': False}
+)
 
-# --- Enhanced Prompt Engineering ---
-SALES_PROMPT_TEMPLATE = """Analyze this {doc_type} document:
-{context}
+# Initialize Google Gemini 1.5 Pro
+llm = ChatGoogleGenerativeAI(
+    model=GOOGLE_MODEL,
+    google_api_key=GOOGLE_API_KEY,
+    temperature=0.7
+)
+
+
+def load_faiss_index_from_s3(bucket, prefix):
+    """Load the latest FAISS index from S3."""
+    try:
+        # List objects in the specified S3 prefix
+        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        if 'Contents' not in response:
+            logging.warning(f"No FAISS index found at {prefix}")
+            return None
+
+        # Find the latest .faiss file (assuming the most recent file is desired)
+        faiss_files = [obj for obj in response['Contents'] if obj['Key'].endswith('.faiss')]
+        if not faiss_files:
+            logging.warning(f"No .faiss files found at {prefix}")
+            return None
+
+        latest_file = max(faiss_files, key=lambda x: x['LastModified'])
+        faiss_key = latest_file['Key']
+
+        # Download FAISS index files to a temporary directory
+        with tempfile.TemporaryDirectory() as temp_dir:
+            faiss_local_path = os.path.join(temp_dir, "faiss_index.faiss")
+            pkl_local_path = os.path.join(temp_dir, "faiss_index.pkl")
+
+            # Download .faiss file
+            s3_client.download_file(bucket, faiss_key, faiss_local_path)
+            # Download corresponding .pkl file (assumes it exists with the same base name)
+            pkl_key = faiss_key.replace(".faiss", ".pkl")
+            s3_client.download_file(bucket, pkl_key, pkl_local_path)
+
+            # Load FAISS index
+            vector_store = FAISS.load_local(temp_dir, "faiss_index", embeddings, allow_dangerous_deserialization=True)
+            logging.info(f"Loaded FAISS index from {faiss_key}")
+            return vector_store
+
+    except Exception as e:
+        logging.error(f"Failed to load FAISS index from {prefix}: {str(e)}")
+        return None
+
+
+def merge_vector_stores(po_store, proforma_store):
+    """Merge PO and Proforma FAISS vector stores into a single store."""
+    if po_store and proforma_store:
+        # Merge the two stores
+        combined_store = FAISS.from_texts(
+            po_store.get_texts() + proforma_store.get_texts(),
+            embeddings
+        )
+        logging.info("Merged PO and Proforma FAISS indexes")
+        return combined_store
+    elif po_store:
+        return po_store
+    elif proforma_store:
+        return proforma_store
+    else:
+        return None
+
+
+# Load and merge FAISS indexes
+po_vector_store = load_faiss_index_from_s3(S3_BUCKET, PO_INDEX_PATH)
+proforma_vector_store = load_faiss_index_from_s3(S3_BUCKET, PROFORMA_INDEX_PATH)
+vector_store = merge_vector_stores(po_vector_store, proforma_vector_store)
+
+# Define the prompt template
+prompt_template = """
+You are a helpful assistant answering questions based on Purchase Order (PO) and Proforma Invoice documents.
+Use the following context to provide accurate and concise answers. If the context doesn't contain relevant information, say so.
+
+Context: {context}
 
 Question: {question}
 
-Format requirements:
-- Currency amounts in USD
-- {date_requirement}
-- Reference {clause_type} numbers
-- Add "Verify with original document for binding terms" disclaimer"""
+Answer:
+"""
+prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
 
-PROMPT_CONFIG = {
-    "po": {
-        "date_requirement": "Highlight shipment dates in bold",
-        "clause_type": "PO clause"
-    },
-    "proforma": {
-        "date_requirement": "Highlight expiration dates in bold",
-        "clause_type": "invoice clause"
-    }
-}
+# Set up RetrievalQA chain
+if vector_store:
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=vector_store.as_retriever(search_kwargs={"k": 3}),  # Retrieve top 3 relevant chunks
+        return_source_documents=True,
+        chain_type_kwargs={"prompt": prompt}
+    )
+else:
+    qa_chain = None
+    st.error("No FAISS index loaded. Chatbot functionality is limited.")
 
-# --- RAG System Core ---
-class SalesRAGSystem:
-    def __init__(self):
-        self.s3_client = self._initialize_s3_client()
-        self.embeddings = HuggingFaceEmbeddings(model_name=CONFIG["embeddings_model"])
-        self.vector_stores = self._load_vector_stores()
-        self.llm = ChatGoogleGenerativeAI(
-            model=CONFIG["google_model"],
-            temperature=0.2,
-            google_api_key=st.secrets["gemini_api_key"]  # Gemini API key from secrets
-        )
+# Streamlit UI
+st.title("PO & Proforma Invoice Chatbot")
+st.write("Ask questions about Purchase Orders or Proforma Invoices!")
 
-    def _initialize_s3_client(self):
-        """Create authenticated S3 client using credentials from Streamlit secrets"""
-        return boto3.client(
-            's3',
-            aws_access_key_id=st.secrets["access_key_id"],
-            aws_secret_access_key=st.secrets["secret_access_key"],
-            region_name=st.secrets["AWS_REGION"]
-        )
+# Chat input
+user_input = st.text_input("Your question:", "")
 
-    def _download_s3_folder(self, s3_path, local_dir):
-        """Download entire FAISS index folder from S3"""
-        bucket_name = s3_path.split('/')[2]
-        prefix = '/'.join(s3_path.split('/')[3:])
+if user_input:
+    if qa_chain:
         try:
-            paginator = self.s3_client.get_paginator('list_objects_v2')
-            for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
-                for obj in page.get('Contents', []):
-                    s3_key = obj['Key']
-                    local_path = os.path.join(local_dir, os.path.relpath(s3_key, prefix))
-                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                    self.s3_client.download_file(bucket_name, s3_key, local_path)
-        except ClientError as e:
-            logger.error(f"S3 download failed: {str(e)}")
-            raise RuntimeError("Failed to download FAISS index from S3.")
+            # Run the query
+            result = qa_chain({"query": user_input})
+            answer = result["result"]
+            source_docs = result["source_documents"]
 
-    def _load_vector_stores(self):
-        """Load indexes directly from S3 paths"""
-        stores = {}
-        for doc_type, s3_path in CONFIG["faiss_paths"].items():
-            try:
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    self._download_s3_folder(s3_path, temp_dir)
-                    stores[doc_type] = FAISS.load_local(
-                        temp_dir,
-                        self.embeddings,
-                        allow_dangerous_deserialization=True
-                    )
-                    logger.info(f"Loaded {doc_type} index from S3 path: {s3_path}")
-            except Exception as e:
-                logger.error(f"Failed loading {doc_type}: {str(e)}")
-                raise RuntimeError(f"Failed to load FAISS index for {doc_type}.")
-        return stores
+            # Display the answer
+            st.write("**Answer:**")
+            st.write(answer)
 
-    def query_transform(self, user_query, doc_type):
-        """Enhance query with document-specific context"""
-        enhancements = CONFIG["query_enhancements"].get(doc_type, [])
-        return f"{user_query} [Context: {' '.join(enhancements)}]"
-
-    def create_pipeline(self, doc_type):
-        """Create retrieval pipeline for specific document type"""
-        return RetrievalQA.from_chain_type(
-            llm=self.llm,
-            retriever=self.vector_stores[doc_type].as_retriever(search_kwargs={"k": 5}),
-            chain_type="map_reduce",
-            return_source_documents=False,  # Don't include source documents in the output
-            chain_type_kwargs={
-                "prompt": self._create_prompt(doc_type),
-                "document_prompt": PromptTemplate(
-                    input_variables=["page_content"],
-                    template="{page_content}"
-                )
-            }
-        )
-
-    def _create_prompt(self, doc_type):
-        """Generate document-specific prompt"""
-        return PromptTemplate(
-            template=SALES_PROMPT_TEMPLATE,
-            input_variables=["context", "question"],
-            partial_variables={
-                "doc_type": doc_type.upper(),
-                **PROMPT_CONFIG.get(doc_type, {})
-            }
-        )
-
-# --- Streamlit Interface ---
-def main():
-    st.title("Sales Document Chatbot")
-
-    query = st.text_input("Ask about documents:",
-                          placeholder="e.g., 'Payment terms for INV-2024-789'")
-
-    if query:
-        try:
-            rag_system = SalesRAGSystem()
-
-            doc_type = detect_document_type(query)
-            processed_query = rag_system.query_transform(query, doc_type)
-
-            pipeline = rag_system.create_pipeline(doc_type)
-            result = pipeline.invoke({"query": processed_query})
-
-            # Display chatbot response
-            st.subheader(f"{doc_type.upper()} Response")
-            st.markdown(result["result"])
-
-            # Audit logging
-            logger.info(f"""
-                Document Type: {doc_type}
-                Original Query: {query}
-                Enhanced Query: {processed_query}
-                Response: {result['result'][:300]}...
-            """)
+            # Display source documents (optional)
+            with st.expander("Source Documents"):
+                for i, doc in enumerate(source_docs):
+                    st.write(f"**Document {i + 1}:**")
+                    st.write(doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content)
 
         except Exception as e:
-            st.error("Analysis failed. Please try again.")
-            logger.error(f"Query failure: {str(e)}")
+            st.error(f"Error processing your question: {str(e)}")
+    else:
+        st.write("Sorry, I can't answer questions without a loaded FAISS index.")
 
-if __name__ == "__main__":
-    main()
+# Footer
+st.write("Powered by Gemini 1.5 Pro and FAISS embeddings.")
