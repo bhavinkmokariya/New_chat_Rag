@@ -7,7 +7,6 @@ from langchain_community.vectorstores import FAISS
 import google.generativeai as genai
 from typing import List, Optional
 import streamlit as st
-import time
 
 # Configuration constants
 S3_BUCKET = "kalika-rag"
@@ -16,10 +15,9 @@ PO_FOLDER = "PO_Dump/"
 PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/"
 PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-MAX_RETRIES = 3
-RETRY_DELAY = 3  # seconds
+GEMINI_API_KEY = "AIzaSyBdE-BuXNESWGaXEQDZ5gJxgRqlyzchltM"  # Replace with your actual API key
 
-# Configure logging
+# Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -29,108 +27,106 @@ logging.basicConfig(
 
 class SalesChatbot:
     def __init__(self):
-        # Initialize Gemini model first
-        self.gemini_api_key = st.secrets.get("gemini_api_key", "")
-        if not self.gemini_api_key:
-            logging.warning("Gemini API key not found in secrets. Some features may not work.")
-        else:
-            genai.configure(api_key=self.gemini_api_key)
-            self.gemini_model = genai.GenerativeModel('gemini-1.5-pro')
+        # Configure Gemini API
+        genai.configure(api_key=GEMINI_API_KEY)
+        self.gemini_model = genai.GenerativeModel('gemini-1.5-pro')
 
         # Initialize S3 client
-        try:
-            self.s3_client = boto3.client(
-                "s3",
-                aws_access_key_id=st.secrets["access_key_id"],
-                aws_secret_access_key=st.secrets["secret_access_key"],
-            )
-        except Exception as e:
-            logging.error(f"Failed to initialize S3 client: {str(e)}")
-            self.s3_client = None
+        self.s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=st.secrets["access_key_id"],
+            aws_secret_access_key=st.secrets["secret_access_key"],
+        )
 
         # Initialize embeddings
-        try:
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name=EMBEDDING_MODEL,
-                model_kwargs={'device': 'cpu'},
-                encode_kwargs={'normalize_embeddings': False}
-            )
-        except Exception as e:
-            logging.error(f"Failed to initialize embeddings model: {str(e)}")
-            self.embeddings = None
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': False}
+        )
 
-        # Load indices if possible
-        self.proforma_index = None
-        self.po_index = None
+        # Load indices
+        self.proforma_index = self.load_faiss_index(PROFORMA_INDEX_PATH)
+        self.po_index = self.load_faiss_index(PO_INDEX_PATH)
 
-        if self.s3_client and self.embeddings:
-            self.proforma_index = self.load_faiss_index(PROFORMA_INDEX_PATH)
-            self.po_index = self.load_faiss_index(PO_INDEX_PATH)
+        # Log initialization status
+        if self.proforma_index:
+            logging.info("Proforma index loaded successfully")
+        else:
+            logging.warning("Failed to load proforma index")
+
+        if self.po_index:
+            logging.info("PO index loaded successfully")
+        else:
+            logging.warning("Failed to load PO index")
 
     def load_faiss_index(self, s3_prefix: str) -> Optional[FAISS]:
-        """Load FAISS index from S3 with retries."""
-        if not self.s3_client:
-            return None
+        """Load FAISS index from S3 with proper file handling."""
+        try:
+            # List all objects in the prefix
+            response = self.s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=s3_prefix)
 
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = self.s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=s3_prefix)
+            if 'Contents' not in response:
+                logging.warning(f"No files found in S3 at {s3_prefix}")
+                return None
 
-                if 'Contents' not in response:
-                    logging.warning(f"No FAISS index found at {s3_prefix}")
+            # Create temporary directory
+            with tempfile.TemporaryDirectory() as temp_dir:
+                logging.info(f"Created temporary directory: {temp_dir}")
+
+                # Download all .faiss and .pkl files
+                faiss_file = None
+                pkl_file = None
+
+                for obj in response['Contents']:
+                    key = obj['Key']
+                    filename = os.path.basename(key)
+                    local_path = os.path.join(temp_dir, filename)
+
+                    # Only download .faiss and .pkl files
+                    if filename.endswith('.faiss') or filename.endswith('.pkl'):
+                        self.s3_client.download_file(S3_BUCKET, key, local_path)
+                        logging.info(f"Downloaded {key} to {local_path}")
+
+                        if filename.endswith('.faiss'):
+                            faiss_file = filename
+                        elif filename.endswith('.pkl'):
+                            pkl_file = filename
+
+                if not faiss_file or not pkl_file:
+                    logging.error(f"Missing required FAISS index files in {s3_prefix}")
                     return None
 
-                # Create temp directory with unique name to avoid conflicts
-                with tempfile.TemporaryDirectory(prefix=f"faiss_index_{s3_prefix.replace('/', '_')}") as temp_dir:
-                    # Track what we downloaded to ensure we have all required files
-                    downloaded_files = []
+                # Create simple index files with standard names
+                index_name = "faiss_index"
 
-                    for obj in response['Contents']:
-                        if obj['Key'].endswith('.faiss') or obj['Key'].endswith('.pkl'):
-                            filename = os.path.basename(obj['Key'])
-                            local_path = os.path.join(temp_dir, filename)
-                            self.s3_client.download_file(S3_BUCKET, obj['Key'], local_path)
-                            downloaded_files.append(filename)
+                # Rename files to standard names expected by FAISS
+                os.rename(
+                    os.path.join(temp_dir, faiss_file),
+                    os.path.join(temp_dir, f"{index_name}.faiss")
+                )
+                os.rename(
+                    os.path.join(temp_dir, pkl_file),
+                    os.path.join(temp_dir, f"{index_name}.pkl")
+                )
 
-                    # Verify we have both required file types
-                    has_faiss = any(f.endswith('.faiss') for f in downloaded_files)
-                    has_pkl = any(f.endswith('.pkl') for f in downloaded_files)
+                logging.info(f"Renamed files to standard format in {temp_dir}")
 
-                    if not (has_faiss and has_pkl):
-                        logging.error(f"Missing required index files in {s3_prefix}. Found: {downloaded_files}")
-                        return None
+                # List directory contents for debugging
+                logging.info(f"Directory contents: {os.listdir(temp_dir)}")
 
-                    # Load the index using the correct index name (the part before the file extension)
-                    index_name = None
-                    for f in downloaded_files:
-                        if f.endswith('.faiss'):
-                            index_name = f[:-6]  # Remove '.faiss' extension
-                            break
+                # Load the index with the standard name
+                index = FAISS.load_local(temp_dir, index_name, self.embeddings, allow_dangerous_deserialization=True)
+                logging.info(f"Successfully loaded FAISS index from {s3_prefix}")
+                return index
 
-                    if not index_name:
-                        logging.error(f"Could not determine index name from files: {downloaded_files}")
-                        return None
-
-                    index = FAISS.load_local(temp_dir, index_name, self.embeddings,
-                                             allow_dangerous_deserialization=True)
-                    logging.info(f"Successfully loaded FAISS index from {s3_prefix}")
-                    return index
-
-            except Exception as e:
-                if attempt < MAX_RETRIES - 1:
-                    logging.warning(
-                        f"Attempt {attempt + 1}/{MAX_RETRIES} failed to load index from {s3_prefix}: {str(e)}")
-                    time.sleep(RETRY_DELAY)
-                else:
-                    logging.error(f"All attempts failed to load FAISS index from {s3_prefix}: {str(e)}")
-
-        return None
+        except Exception as e:
+            logging.error(f"Failed to load FAISS index from {s3_prefix}: {str(e)}")
+            logging.exception("Detailed error:")
+            return None
 
     def query_gemini(self, prompt: str) -> str:
         """Call Gemini 1.5 Pro to generate a response."""
-        if not hasattr(self, 'gemini_model'):
-            return "Gemini API is not configured properly."
-
         try:
             response = self.gemini_model.generate_content(
                 prompt,
@@ -142,47 +138,52 @@ class SalesChatbot:
             return response.text
         except Exception as e:
             logging.error(f"Gemini API error: {str(e)}")
-            return "I'm having trouble connecting to my knowledge base right now. Could you please try again later or ask a different question?"
+            return "I'm having trouble connecting to my AI brain right now. Please try again later."
 
     def search_documents(self, query: str, index_type: str) -> List[str]:
         """Search FAISS index for relevant document chunks."""
         index = self.proforma_index if index_type == "proforma" else self.po_index
 
         if not index:
-            return [
-                f"I don't have access to the {index_type} database right now. Please check if the indices have been properly loaded."]
+            return [f"I don't have access to the {index_type} documents right now."]
 
         try:
             results = index.similarity_search(query, k=3)  # Top 3 matches
             return [doc.page_content for doc in results]
         except Exception as e:
             logging.error(f"Error searching {index_type} index: {str(e)}")
-            return ["I'm having trouble searching through the documents right now."]
+            return ["Error during document search."]
 
     def process_query(self, user_input: str) -> str:
         """Process user query and return a response."""
-        if not user_input.strip():
-            return "Please ask me a question about proforma invoices or purchase orders."
-
         user_input = user_input.lower()
 
-        # Check if indices are available
-        if not (self.proforma_index or self.po_index):
-            return ("I'm currently unable to access the document database. Please check that the FAISS indices "
-                    "have been properly uploaded to S3 and that your AWS credentials are correct.")
+        # Handle missing indices case
+        if not self.proforma_index and not self.po_index:
+            return ("I'm currently unable to access any document databases. Please check that the FAISS indices "
+                    "have been properly uploaded to S3.")
 
         # Determine intent and document type
         if "proforma" in user_input or "invoice" in user_input:
             doc_type = "proforma"
+            if not self.proforma_index:
+                return "I'm sorry, but I don't have access to proforma invoice data right now."
             search_results = self.search_documents(user_input, "proforma")
         elif "po" in user_input or "purchase order" in user_input:
             doc_type = "po"
+            if not self.po_index:
+                return "I'm sorry, but I don't have access to purchase order data right now."
             search_results = self.search_documents(user_input, "po")
         else:
             # Use Gemini to interpret ambiguous queries
             prompt = f"Determine if the following query is about Proforma Invoices or Purchase Orders: '{user_input}'. Respond with only 'proforma' or 'po'."
             doc_type_response = self.query_gemini(prompt).strip().lower()
             doc_type = "proforma" if "proforma" in doc_type_response else "po"
+
+            # Check if we have the required index
+            if (doc_type == "proforma" and not self.proforma_index) or (doc_type == "po" and not self.po_index):
+                return f"I've determined your question is about {doc_type}, but I don't have access to that data right now."
+
             search_results = self.search_documents(user_input, doc_type)
 
         # Construct a prompt for Gemini to generate a natural response
@@ -196,75 +197,40 @@ class SalesChatbot:
         return response
 
 
-def run_chatbot():
-    """Run the chatbot in console mode"""
+def main():
+    """Main function to run the chatbot"""
     print("Initializing Sales Chatbot...")
-    chatbot = SalesChatbot()
-    print("Sales Chatbot: How can I assist you today? (Type 'exit' to quit)")
+    try:
+        chatbot = SalesChatbot()
+        print("Sales Chatbot: How can I assist you today? (Type 'exit' to quit)")
 
-    while True:
-        try:
-            user_input = input("You: ").strip()
-            if not user_input:
-                continue
+        while True:
+            try:
+                user_input = input("You: ").strip()
+                if not user_input:
+                    continue
 
-            if user_input.lower() in ("exit", "quit", "bye"):
-                print("Sales Chatbot: Goodbye!")
+                if user_input.lower() in ("exit", "quit", "bye"):
+                    print("Sales Chatbot: Goodbye!")
+                    break
+
+                response = chatbot.process_query(user_input)
+                print(f"Sales Chatbot: {response}")
+
+            except EOFError:
+                print("\nInput terminated. Exiting...")
                 break
+            except KeyboardInterrupt:
+                print("\nSales Chatbot: Session terminated by user. Goodbye!")
+                break
+            except Exception as e:
+                logging.error(f"Error in chat loop: {str(e)}")
+                print("Sales Chatbot: I encountered an error. Please try again.")
 
-            response = chatbot.process_query(user_input)
-            print(f"Sales Chatbot: {response}")
-
-        except KeyboardInterrupt:
-            print("\nSales Chatbot: Session terminated by user. Goodbye!")
-            break
-        except Exception as e:
-            logging.error(f"Unexpected error in main loop: {str(e)}")
-            print("Sales Chatbot: I encountered an unexpected error. Please try again.")
-
-
-def streamlit_app():
-    """Run the chatbot as a Streamlit app"""
-    st.title("Sales Document Assistant")
-    st.write("Ask me questions about your proforma invoices and purchase orders!")
-
-    # Initialize chatbot
-    if 'chatbot' not in st.session_state:
-        st.session_state.chatbot = SalesChatbot()
-
-    # Chat history
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-
-    # Display chat history
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    # User input
-    user_input = st.chat_input("Ask something about your invoices or purchase orders...")
-
-    if user_input:
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.markdown(user_input)
-
-        # Generate and display assistant response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                response = st.session_state.chatbot.process_query(user_input)
-                st.markdown(response)
-
-        # Add assistant response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": response})
+    except Exception as e:
+        logging.error(f"Failed to initialize chatbot: {str(e)}")
+        print("Failed to initialize the Sales Chatbot. Check logs for details.")
 
 
 if __name__ == "__main__":
-    import sys
-
-    # Check if we're running in Streamlit
-    if 'streamlit' in sys.modules:
-        streamlit_app()
-    else:
-        run_chatbot()
+    main()
