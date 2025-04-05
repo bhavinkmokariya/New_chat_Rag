@@ -95,7 +95,7 @@ def load_faiss_index_from_s3(s3_client):
 
 
 # Query the FAISS index
-def query_faiss_index(vector_store, query, k=3):
+def query_faiss_index(vector_store, query, k=1000):
     try:
         results = vector_store.similarity_search(query, k=k)
         return results
@@ -108,11 +108,11 @@ def query_faiss_index(vector_store, query, k=3):
 def generate_response(model, query, faiss_results):
     try:
         if not faiss_results:
-            return "No relevant information found in the proforma invoices."
+            return "No relevant information found in the documents."
 
         # Combine FAISS results into a context
         context = "\n\n".join([result.page_content for result in faiss_results])
-        prompt = f"Based on the following information from proforma invoices:\n\n{context}\n\nAnswer the query: {query}"
+        prompt = f"Based on the following information:\n\n{context}\n\nAnswer the query: {query}"
 
         response = model.generate_content(prompt)
         return response.text
@@ -121,9 +121,18 @@ def generate_response(model, query, faiss_results):
         return "An error occurred while generating the response."
 
 
+# Display results directly from FAISS
+def display_faiss_results(faiss_results):
+    if not faiss_results:
+        return "No relevant information found in the documents."
+
+    results_text = "\n\n".join([result.page_content for result in faiss_results])
+    return results_text
+
+
 # Main chatbot interface
 def main():
-    st.title("Proforma Invoice Chatbot with Gemini")
+    st.title("Document Search and Answer Chatbot with Gemini")
 
     # Initialize S3 client and Gemini model
     s3_client = init_s3_client()
@@ -146,8 +155,8 @@ def main():
 
     # Query input and response
     if vector_store:
-        st.subheader("Ask a Question")
-        query = st.text_input("Enter your query about the proforma invoices:")
+        st.subheader("Ask a Question or Search for Information")
+        query = st.text_input("Enter your query:")
 
         if st.button("Submit"):
             if query:
@@ -155,8 +164,12 @@ def main():
                     # Search FAISS index
                     faiss_results = query_faiss_index(vector_store, query)
 
-                    # Generate response with Gemini
-                    response = generate_response(gemini_model, query, faiss_results)
+                    # Display results directly or generate response with Gemini
+                    display_results = st.checkbox("Display raw results instead of generating a response")
+                    if display_results:
+                        response = display_faiss_results(faiss_results)
+                    else:
+                        response = generate_response(gemini_model, query, faiss_results)
 
                 st.subheader("Response")
                 st.write(response)
