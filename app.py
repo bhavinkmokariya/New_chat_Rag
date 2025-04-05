@@ -22,19 +22,17 @@ logger = logging.getLogger("sales_rag")
 CONFIG = {
     "embeddings_model": "sentence-transformers/all-MiniLM-L6-v2",
     "faiss_paths": {
-        "po": "po_faiss_index/",
-        "proforma": "proforma_faiss_index/"
+        "po": "s3://kalika-rag/po_faiss_index/",  # Full S3 path to PO FAISS index
+        "proforma": "s3://kalika-rag/proforma_faiss_index/"  # Full S3 path to Proforma FAISS index
     },
-    "google_model": st.secrets["GEMINI_MODEL"],  # Gemini model name from secrets
+    "google_model": st.secrets["gemini_api_key"],  # Gemini model name from secrets
     "query_enhancements": {
         "po": ["include shipment terms", "reference PO number", "note delivery address"],
         "proforma": ["include pricing terms", "reference payment conditions", "note delivery timelines"]
     },
     "s3_bucket": st.secrets["S3_BUCKET_NAME"],  # Bucket name from secrets
-    "s3_prefix": st.secrets["S3_PREFIX"],  # Prefix for FAISS indexes in S3 from secrets
     "aws_region": st.secrets["AWS_REGION"]  # AWS region from secrets
 }
-
 
 # --- Document Type Detection ---
 def detect_document_type(query):
@@ -48,7 +46,6 @@ def detect_document_type(query):
     elif any(kw in query_lower for kw in proforma_keywords):
         return 'proforma'
     return 'general'
-
 
 # --- Enhanced Prompt Engineering ---
 SALES_PROMPT_TEMPLATE = """Analyze this {doc_type} document:
@@ -73,13 +70,12 @@ PROMPT_CONFIG = {
     }
 }
 
-
 # --- RAG System Core ---
 class SalesRAGSystem:
     def __init__(self):
         self.s3_client = self._initialize_s3_client()
         self.embeddings = HuggingFaceEmbeddings(model_name=CONFIG["embeddings_model"])
-        self.vector_stores = self._load_vector_stores_from_s3()
+        self.vector_stores = self._load_vector_stores()
         self.llm = ChatGoogleGenerativeAI(
             model=CONFIG["google_model"],
             temperature=0.2,
@@ -95,42 +91,43 @@ class SalesRAGSystem:
             region_name=st.secrets["AWS_REGION"]
         )
 
-    def _download_s3_folder(self, s3_prefix, local_dir):
-        """Download entire FAISS index folder from S3"""
-        try:
-            paginator = self.s3_client.get_paginator('list_objects_v2')
-            for page in paginator.paginate(Bucket=CONFIG["s3_bucket"], Prefix=s3_prefix):
-                for obj in page.get('Contents', []):
-                    s3_key = obj['Key']
-                    local_path = os.path.join(local_dir, os.path.relpath(s3_key, s3_prefix))
-                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                    self.s3_client.download_file(CONFIG["s3_bucket"], s3_key, local_path)
-        except ClientError as e:
-            logger.error(f"S3 download failed: {str(e)}")
-            raise
-
     def _load_vector_stores(self):
-        """Load indexes from S3 to temporary directory"""
+        """Load indexes directly from S3 paths"""
         stores = {}
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            for doc_type, s3_path in CONFIG["faiss_paths"].items():
-                try:
-                    full_prefix = f"{CONFIG['s3_prefix']}{s3_path}"
-                    self._download_s3_folder(full_prefix, temp_dir)
-
+        for doc_type, s3_path in CONFIG["faiss_paths"].items():
+            try:
+                # Since FAISS.load_local does not directly support S3 paths,
+                # you need to download the index first or use a library that supports S3.
+                # Here, we'll download it to a temporary directory.
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    self._download_s3_folder(s3_path, temp_dir)
                     stores[doc_type] = FAISS.load_local(
-                        os.path.join(temp_dir, s3_path),
+                        temp_dir,
                         self.embeddings,
                         allow_dangerous_deserialization=True
                     )
-                    logger.info(f"Loaded {doc_type} index from S3")
-
-                except Exception as e:
-                    logger.error(f"Failed loading {doc_type}: {str(e)}")
-                    raise
+                    logger.info(f"Loaded {doc_type} index from S3 path: {s3_path}")
+            except Exception as e:
+                logger.error(f"Failed loading {doc_type}: {str(e)}")
+                raise
 
         return stores
+
+    def _download_s3_folder(self, s3_path, local_dir):
+        """Download entire FAISS index folder from S3"""
+        bucket_name = s3_path.split('/')[2]
+        prefix = '/'.join(s3_path.split('/')[3:])
+        try:
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+                for obj in page.get('Contents', []):
+                    s3_key = obj['Key']
+                    local_path = os.path.join(local_dir, os.path.relpath(s3_key, prefix))
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    self.s3_client.download_file(bucket_name, s3_key, local_path)
+        except ClientError as e:
+            logger.error(f"S3 download failed: {str(e)}")
+            raise
 
     def query_transform(self, user_query, doc_type):
         """Enhance query with document-specific context"""
@@ -163,7 +160,6 @@ class SalesRAGSystem:
                 **PROMPT_CONFIG.get(doc_type, {})
             }
         )
-
 
 # --- Streamlit Interface ---
 def main():
