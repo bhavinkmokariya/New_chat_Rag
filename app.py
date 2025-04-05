@@ -10,7 +10,6 @@ import google.generativeai as genai
 # Configuration constants
 S3_BUCKET = "kalika-rag"
 S3_PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/"
-S3_PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"  # From the first document
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 GEMINI_MODEL = "gemini-1.5-pro"
 
@@ -21,12 +20,22 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Initialize embeddings model
-embeddings = HuggingFaceEmbeddings(
-    model_name=EMBEDDING_MODEL,
-    model_kwargs={'device': 'cpu'},
-    encode_kwargs={'normalize_embeddings': False}
-)
+
+# Initialize embeddings model with Hugging Face token
+def init_embeddings():
+    try:
+        embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': False},
+            huggingfacehub_api_token=st.secrets["huggingface_token"]
+        )
+        return embeddings
+    except Exception as e:
+        logging.error(f"Failed to initialize embeddings: {str(e)}")
+        st.error("Failed to initialize embeddings. Please check your Hugging Face token.")
+        return None
+
 
 # Initialize S3 client using Streamlit secrets
 def init_s3_client():
@@ -42,6 +51,7 @@ def init_s3_client():
         st.error("Failed to connect to S3. Please check your credentials.")
         return None
 
+
 # Initialize Gemini API
 def init_gemini():
     try:
@@ -53,46 +63,34 @@ def init_gemini():
         st.error("Failed to connect to Gemini API. Please check your API key.")
         return None
 
-# Load FAISS index from S3 and calculate size
-def load_faiss_index_from_s3(s3_client, index_path):
+
+# Load FAISS index from S3
+def load_faiss_index_from_s3(s3_client, embeddings):
     try:
-        response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=index_path)
+        response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_PROFORMA_INDEX_PATH)
 
         if 'Contents' not in response:
-            logging.warning(f"No FAISS index found in S3 at {index_path}.")
+            logging.warning("No FAISS index found in S3.")
             return None
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            total_size = 0
             for obj in response['Contents']:
                 key = obj['Key']
                 local_path = os.path.join(temp_dir, os.path.basename(key))
                 s3_client.download_file(S3_BUCKET, key, local_path)
-                file_size = os.path.getsize(local_path)  # Get size in bytes
-                total_size += file_size
-                logging.info(f"Downloaded FAISS file: {key} ({file_size / 1024:.2f} KB)")
-
-            # Convert total size to human-readable format
-            if total_size < 1024:
-                size_str = f"{total_size} bytes"
-            elif total_size < 1024 * 1024:
-                size_str = f"{total_size / 1024:.2f} KB"
-            else:
-                size_str = f"{total_size / (1024 * 1024):.2f} MB"
-
-            st.write(f"Total size of FAISS index being loaded: {size_str}")
-            logging.info(f"Total FAISS index size: {size_str}")
+                logging.info(f"Downloaded FAISS file: {key}")
 
             vector_store = FAISS.load_local(temp_dir, embeddings, allow_dangerous_deserialization=True)
-            logging.info(f"Successfully loaded FAISS index from S3 at {index_path}")
+            logging.info("Successfully loaded FAISS index from S3")
             return vector_store
 
     except Exception as e:
-        logging.error(f"Failed to load FAISS index from S3 at {index_path}: {str(e)}")
+        logging.error(f"Failed to load FAISS index from S3: {str(e)}")
         return None
 
+
 # Query the FAISS index
-def query_faiss_index(vector_store, query, k=100):
+def query_faiss_index(vector_store, query, k=3):
     try:
         results = vector_store.similarity_search(query, k=k)
         return results
@@ -100,15 +98,20 @@ def query_faiss_index(vector_store, query, k=100):
         logging.error(f"Error querying FAISS index: {str(e)}")
         return None
 
-# Generate response using Gemini
-def generate_response(model, query, faiss_results, index_type):
+
+# Generate response using Gemini tailored for sales team
+def generate_sales_response(model, query, faiss_results):
     try:
         if not faiss_results:
-            return f"No relevant information found in the {index_type} documents."
+            return "No relevant information found in the proforma invoices for the sales team."
 
         # Combine FAISS results into a context
         context = "\n\n".join([result.page_content for result in faiss_results])
-        prompt = f"Based on the following information from {index_type} documents:\n\n{context}\n\nAnswer the query: {query}"
+        prompt = (
+            f"You are assisting a sales team. Based on the following information from proforma invoices:\n\n"
+            f"{context}\n\n"
+            f"Provide a concise, sales-focused answer to the query: {query}"
+        )
 
         response = model.generate_content(prompt)
         return response.text
@@ -116,52 +119,50 @@ def generate_response(model, query, faiss_results, index_type):
         logging.error(f"Error generating response with Gemini: {str(e)}")
         return "An error occurred while generating the response."
 
+
 # Main chatbot interface
 def main():
-    st.title("Invoice Chatbot with Gemini")
+    st.title("Sales Team Proforma Invoice Chatbot")
 
-    # Initialize S3 client and Gemini model
+    # Initialize components
+    embeddings = init_embeddings()
     s3_client = init_s3_client()
     gemini_model = init_gemini()
     vector_store = None
 
-    if not s3_client or not gemini_model:
+    if not all([embeddings, s3_client, gemini_model]):
         return
 
-    # Selection for PO or Proforma FAISS index
-    st.subheader("Select Document Type")
-    index_type = st.selectbox("Choose the type of documents to query:", ("Proforma Invoices", "Purchase Orders"))
-    index_path = S3_PROFORMA_INDEX_PATH if index_type == "Proforma Invoices" else S3_PO_INDEX_PATH
-
-    # Load the selected FAISS index
-    with st.spinner(f"Loading {index_type} FAISS index from S3..."):
-        vector_store = load_faiss_index_from_s3(s3_client, index_path)
+    # Load FAISS index
+    with st.spinner("Loading FAISS index from S3..."):
+        vector_store = load_faiss_index_from_s3(s3_client, embeddings)
 
     if vector_store:
-        st.success(f"{index_type} FAISS index successfully loaded from S3!")
-        st.write(f"FAISS index is loaded from: s3://{S3_BUCKET}/{index_path}")
+        st.success("FAISS index successfully loaded from S3!")
+        st.write(f"FAISS index is loaded from: s3://{S3_BUCKET}/{S3_PROFORMA_INDEX_PATH}")
     else:
-        st.error(f"No FAISS index found in S3 for {index_type} or failed to load the index.")
+        st.error("No FAISS index found in S3 or failed to load the index.")
         return
 
     # Query input and response
-    if vector_store:
-        st.subheader("Ask a Question")
-        query = st.text_input(f"Enter your query about the {index_type.lower()}:")
+    st.subheader("Sales Team Query")
+    query = st.text_input(
+        "Enter your sales-related query about the proforma invoices (e.g., 'What is the total amount?', 'Who is the client?'):")
 
-        if st.button("Submit"):
-            if query:
-                with st.spinner("Searching and generating response..."):
-                    # Search FAISS index
-                    faiss_results = query_faiss_index(vector_store, query)
+    if st.button("Submit"):
+        if query:
+            with st.spinner("Searching and generating sales-focused response..."):
+                # Search FAISS index
+                faiss_results = query_faiss_index(vector_store, query)
 
-                    # Generate response with Gemini
-                    response = generate_response(gemini_model, query, faiss_results, index_type.lower())
+                # Generate sales-focused response with Gemini
+                response = generate_sales_response(gemini_model, query, faiss_results)
 
-                st.subheader("Response")
-                st.write(response)
-            else:
-                st.warning("Please enter a query.")
+            st.subheader("Sales Team Response")
+            st.write(response)
+        else:
+            st.warning("Please enter a query.")
+
 
 if __name__ == "__main__":
     main()
