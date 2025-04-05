@@ -25,7 +25,7 @@ CONFIG = {
         "po": "s3://kalika-rag/faiss_indexes/po_faiss_index/",  # Full S3 path to PO FAISS index
         "proforma": "s3://kalika-rag/faiss_indexes/proforma_faiss_index/"  # Full S3 path to Proforma FAISS index
     },
-    "google_model": st.secrets["GEMINI_MODEL"],  # Gemini model name from secrets
+    "google_model": st.secrets["gemini_api_key"],  # Gemini model name from secrets
     "query_enhancements": {
         "po": ["include shipment terms", "reference PO number", "note delivery address"],
         "proforma": ["include pricing terms", "reference payment conditions", "note delivery timelines"]
