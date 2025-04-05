@@ -95,8 +95,14 @@ def load_faiss_index_from_s3(s3_client):
 
 
 # Query the FAISS index
-def query_faiss_index(vector_store, query, k=3):
+def query_faiss_index(vector_store, query, k=None):
     try:
+        # If k is None, get the total number of documents in the index
+        if k is None:
+            # This is an approximation - FAISS doesn't have a direct way to count entries
+            # You might need to implement this differently based on your setup
+            k = 1000  # Set to a very large number to approximate "all" documents
+
         results = vector_store.similarity_search(query, k=k)
         return results
     except Exception as e:
@@ -156,7 +162,7 @@ def main():
                     faiss_results = query_faiss_index(vector_store, query)
 
                     # Generate response with Gemini
-                    response = generate_response(gemini_model, query, faiss_results)
+                    response = generate_response(gemini_model, query, faiss_results,k=None)
 
                 st.subheader("Response")
                 st.write(response)
