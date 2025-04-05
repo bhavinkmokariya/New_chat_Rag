@@ -18,12 +18,21 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Initialize embeddings model
-embeddings = HuggingFaceEmbeddings(
-    model_name=EMBEDDING_MODEL,
-    model_kwargs={'device': 'cpu'},
-    encode_kwargs={'normalize_embeddings': False}
-)
+
+# Initialize embeddings model with Hugging Face token
+def init_embeddings():
+    try:
+        embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': False},
+            huggingfacehub_api_token=st.secrets["huggingface_token"]
+        )
+        return embeddings
+    except Exception as e:
+        logging.error(f"Failed to initialize embeddings: {str(e)}")
+        st.error("Failed to initialize embeddings. Please check your Hugging Face token.")
+        return None
 
 
 # Initialize S3 client using Streamlit secrets
@@ -42,7 +51,7 @@ def init_s3_client():
 
 
 # Load FAISS index from S3
-def load_faiss_index_from_s3(s3_client):
+def load_faiss_index_from_s3(s3_client, embeddings):
     try:
         # List objects in the S3 index path
         response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_PROFORMA_INDEX_PATH)
@@ -70,24 +79,56 @@ def load_faiss_index_from_s3(s3_client):
         return None
 
 
+# Query the FAISS index
+def query_faiss_index(vector_store, query, k=3):
+    try:
+        # Perform similarity search
+        results = vector_store.similarity_search(query, k=k)
+        return [doc.page_content for doc in results]
+    except Exception as e:
+        logging.error(f"Error querying FAISS index: {str(e)}")
+        return []
+
+
 # Main chatbot interface
 def main():
-    st.title("FAISS Index Loader Chatbot")
+    st.title("FAISS Index Chatbot")
+
+    # Initialize embeddings
+    embeddings = init_embeddings()
+    if not embeddings:
+        return
 
     # Initialize S3 client
     s3_client = init_s3_client()
+    if not s3_client:
+        return
 
-    if s3_client:
-        # Load FAISS index
-        with st.spinner("Loading FAISS index from S3..."):
-            vector_store = load_faiss_index_from_s3(s3_client)
+    # Load FAISS index
+    with st.spinner("Loading FAISS index from S3..."):
+        vector_store = load_faiss_index_from_s3(s3_client, embeddings)
 
-        # Display result
-        if vector_store:
-            st.success("FAISS index successfully loaded from S3!")
-            st.write(f"FAISS index is loaded from: s3://{S3_BUCKET}/{S3_PROFORMA_INDEX_PATH}")
-        else:
-            st.error("No FAISS index found in S3 or failed to load the index.")
+    # Display result of loading
+    if vector_store:
+        st.success("FAISS index successfully loaded from S3!")
+        st.write(f"FAISS index is loaded from: s3://{S3_BUCKET}/{S3_PROFORMA_INDEX_PATH}")
+
+        # Query input and response
+        st.subheader("Ask a Question")
+        query = st.text_input("Enter your query here:")
+
+        if query:
+            with st.spinner("Searching for answers..."):
+                results = query_faiss_index(vector_store, query)
+
+            if results:
+                st.write("**Response:**")
+                for i, result in enumerate(results, 1):
+                    st.write(f"{i}. {result}")
+            else:
+                st.warning("No relevant information found in the FAISS index.")
+    else:
+        st.error("No FAISS index found in S3 or failed to load the index.")
 
 
 if __name__ == "__main__":
