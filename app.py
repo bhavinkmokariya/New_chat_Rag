@@ -1,235 +1,213 @@
 import os
+import streamlit as st
+from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.prompts import PromptTemplate
 import logging
 import boto3
+from botocore.exceptions import ClientError
 import tempfile
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-import google.generativeai as genai
-from typing import List, Optional
-import streamlit as st
 
-# Configuration constants
-S3_BUCKET = "kalika-rag"
-PROFORMA_FOLDER = "proforma_invoice/"
-PO_FOLDER = "PO_Dump/"
-PROFORMA_INDEX_PATH = "faiss_indexes/proforma_faiss_index/"
-PO_INDEX_PATH = "faiss_indexes/po_faiss_index/"
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-GEMINI_API_KEY = "AIzaSyBdE-BuXNESWGaXEQDZ5gJxgRqlyzchltM"  # Replace with your actual API key
-
-# Set up logging
+# --- Logging Setup ---
 logging.basicConfig(
+    filename='sales_rag.log',
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger("sales_rag")
+
+# --- Configuration ---
+CONFIG = {
+    "embeddings_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "faiss_paths": {
+        "po": "po_faiss_index/",
+        "proforma": "proforma_faiss_index/"
+    },
+    "google_model": st.secrets["GEMINI_MODEL"],  # Gemini model name from secrets
+    "query_enhancements": {
+        "po": ["include shipment terms", "reference PO number", "note delivery address"],
+        "proforma": ["include pricing terms", "reference payment conditions", "note delivery timelines"]
+    },
+    "s3_bucket": st.secrets["S3_BUCKET_NAME"],  # Bucket name from secrets
+    "s3_prefix": st.secrets["S3_PREFIX"],  # Prefix for FAISS indexes in S3 from secrets
+    "aws_region": st.secrets["AWS_REGION"]  # AWS region from secrets
+}
 
 
-class SalesChatbot:
+# --- Document Type Detection ---
+def detect_document_type(query):
+    """Route queries to appropriate FAISS index"""
+    po_keywords = {'po', 'purchase order', 'shipment'}
+    proforma_keywords = {'proforma', 'invoice', 'payment'}
+
+    query_lower = query.lower()
+    if any(kw in query_lower for kw in po_keywords):
+        return 'po'
+    elif any(kw in query_lower for kw in proforma_keywords):
+        return 'proforma'
+    return 'general'
+
+
+# --- Enhanced Prompt Engineering ---
+SALES_PROMPT_TEMPLATE = """Analyze this {doc_type} document:
+{context}
+
+Question: {question}
+
+Format requirements:
+- Currency amounts in USD
+- {date_requirement}
+- Reference {clause_type} numbers
+- Add "Verify with original document for binding terms" disclaimer"""
+
+PROMPT_CONFIG = {
+    "po": {
+        "date_requirement": "Highlight shipment dates in bold",
+        "clause_type": "PO clause"
+    },
+    "proforma": {
+        "date_requirement": "Highlight expiration dates in bold",
+        "clause_type": "invoice clause"
+    }
+}
+
+
+# --- RAG System Core ---
+class SalesRAGSystem:
     def __init__(self):
-        # Configure Gemini API
-        genai.configure(api_key=GEMINI_API_KEY)
-        self.gemini_model = genai.GenerativeModel('gemini-1.5-pro')
-
-        # Initialize S3 client
-        self.s3_client = boto3.client(
-            "s3",
-            aws_access_key_id=st.secrets["access_key_id"],
-            aws_secret_access_key=st.secrets["secret_access_key"],
+        self.s3_client = self._initialize_s3_client()
+        self.embeddings = HuggingFaceEmbeddings(model_name=CONFIG["embeddings_model"])
+        self.vector_stores = self._load_vector_stores_from_s3()
+        self.llm = ChatGoogleGenerativeAI(
+            model=CONFIG["google_model"],
+            temperature=0.2,
+            google_api_key=st.secrets["gemini_api_key"]  # Gemini API key from secrets
         )
 
-        # Initialize embeddings
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL,
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': False}
+    def _initialize_s3_client(self):
+        """Create authenticated S3 client"""
+        return boto3.client(
+            's3',
+            aws_access_key_id=st.secrets["access_key_id"],  # Access key from secrets
+            aws_secret_access_key=st.secrets["secret_access_key"],  # Secret key from secrets
+            region_name=st.secrets["AWS_REGION"]
         )
 
-        # Load indices
-        self.proforma_index = self.load_faiss_index(PROFORMA_INDEX_PATH)
-        self.po_index = self.load_faiss_index(PO_INDEX_PATH)
-
-        # Log initialization status
-        if self.proforma_index:
-            logging.info("Proforma index loaded successfully")
-        else:
-            logging.warning("Failed to load proforma index")
-
-        if self.po_index:
-            logging.info("PO index loaded successfully")
-        else:
-            logging.warning("Failed to load PO index")
-
-    def load_faiss_index(self, s3_prefix: str) -> Optional[FAISS]:
-        """Load FAISS index from S3 with proper file handling."""
+    def _download_s3_folder(self, s3_prefix, local_dir):
+        """Download entire FAISS index folder from S3"""
         try:
-            # List all objects in the prefix
-            response = self.s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=s3_prefix)
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=CONFIG["s3_bucket"], Prefix=s3_prefix):
+                for obj in page.get('Contents', []):
+                    s3_key = obj['Key']
+                    local_path = os.path.join(local_dir, os.path.relpath(s3_key, s3_prefix))
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    self.s3_client.download_file(CONFIG["s3_bucket"], s3_key, local_path)
+        except ClientError as e:
+            logger.error(f"S3 download failed: {str(e)}")
+            raise
 
-            if 'Contents' not in response:
-                logging.warning(f"No files found in S3 at {s3_prefix}")
-                return None
+    def _load_vector_stores(self):
+        """Load indexes from S3 to temporary directory"""
+        stores = {}
 
-            # Create temporary directory
-            with tempfile.TemporaryDirectory() as temp_dir:
-                logging.info(f"Created temporary directory: {temp_dir}")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for doc_type, s3_path in CONFIG["faiss_paths"].items():
+                try:
+                    full_prefix = f"{CONFIG['s3_prefix']}{s3_path}"
+                    self._download_s3_folder(full_prefix, temp_dir)
 
-                # Download all .faiss and .pkl files
-                faiss_file = None
-                pkl_file = None
+                    stores[doc_type] = FAISS.load_local(
+                        os.path.join(temp_dir, s3_path),
+                        self.embeddings,
+                        allow_dangerous_deserialization=True
+                    )
+                    logger.info(f"Loaded {doc_type} index from S3")
 
-                for obj in response['Contents']:
-                    key = obj['Key']
-                    filename = os.path.basename(key)
-                    local_path = os.path.join(temp_dir, filename)
+                except Exception as e:
+                    logger.error(f"Failed loading {doc_type}: {str(e)}")
+                    raise
 
-                    # Only download .faiss and .pkl files
-                    if filename.endswith('.faiss') or filename.endswith('.pkl'):
-                        self.s3_client.download_file(S3_BUCKET, key, local_path)
-                        logging.info(f"Downloaded {key} to {local_path}")
+        return stores
 
-                        if filename.endswith('.faiss'):
-                            faiss_file = filename
-                        elif filename.endswith('.pkl'):
-                            pkl_file = filename
+    def query_transform(self, user_query, doc_type):
+        """Enhance query with document-specific context"""
+        enhancements = CONFIG["query_enhancements"].get(doc_type, [])
+        return f"{user_query} [Context: {' '.join(enhancements)}]"
 
-                if not faiss_file or not pkl_file:
-                    logging.error(f"Missing required FAISS index files in {s3_prefix}")
-                    return None
-
-                # Create simple index files with standard names
-                index_name = "faiss_index"
-
-                # Rename files to standard names expected by FAISS
-                os.rename(
-                    os.path.join(temp_dir, faiss_file),
-                    os.path.join(temp_dir, f"{index_name}.faiss")
+    def create_pipeline(self, doc_type):
+        """Create retrieval pipeline for specific document type"""
+        return RetrievalQA.from_chain_type(
+            llm=self.llm,
+            retriever=self.vector_stores[doc_type].as_retriever(search_kwargs={"k": 5}),
+            chain_type="map_reduce",
+            return_source_documents=True,
+            chain_type_kwargs={
+                "prompt": self._create_prompt(doc_type),
+                "document_prompt": PromptTemplate(
+                    input_variables=["page_content"],
+                    template="{page_content}"
                 )
-                os.rename(
-                    os.path.join(temp_dir, pkl_file),
-                    os.path.join(temp_dir, f"{index_name}.pkl")
-                )
-
-                logging.info(f"Renamed files to standard format in {temp_dir}")
-
-                # List directory contents for debugging
-                logging.info(f"Directory contents: {os.listdir(temp_dir)}")
-
-                # Load the index with the standard name
-                index = FAISS.load_local(temp_dir, index_name, self.embeddings, allow_dangerous_deserialization=True)
-                logging.info(f"Successfully loaded FAISS index from {s3_prefix}")
-                return index
-
-        except Exception as e:
-            logging.error(f"Failed to load FAISS index from {s3_prefix}: {str(e)}")
-            logging.exception("Detailed error:")
-            return None
-
-    def query_gemini(self, prompt: str) -> str:
-        """Call Gemini 1.5 Pro to generate a response."""
-        try:
-            response = self.gemini_model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=500,
-                    temperature=0.2
-                )
-            )
-            return response.text
-        except Exception as e:
-            logging.error(f"Gemini API error: {str(e)}")
-            return "I'm having trouble connecting to my AI brain right now. Please try again later."
-
-    def search_documents(self, query: str, index_type: str) -> List[str]:
-        """Search FAISS index for relevant document chunks."""
-        index = self.proforma_index if index_type == "proforma" else self.po_index
-
-        if not index:
-            return [f"I don't have access to the {index_type} documents right now."]
-
-        try:
-            results = index.similarity_search(query, k=3)  # Top 3 matches
-            return [doc.page_content for doc in results]
-        except Exception as e:
-            logging.error(f"Error searching {index_type} index: {str(e)}")
-            return ["Error during document search."]
-
-    def process_query(self, user_input: str) -> str:
-        """Process user query and return a response."""
-        user_input = user_input.lower()
-
-        # Handle missing indices case
-        if not self.proforma_index and not self.po_index:
-            return ("I'm currently unable to access any document databases. Please check that the FAISS indices "
-                    "have been properly uploaded to S3.")
-
-        # Determine intent and document type
-        if "proforma" in user_input or "invoice" in user_input:
-            doc_type = "proforma"
-            if not self.proforma_index:
-                return "I'm sorry, but I don't have access to proforma invoice data right now."
-            search_results = self.search_documents(user_input, "proforma")
-        elif "po" in user_input or "purchase order" in user_input:
-            doc_type = "po"
-            if not self.po_index:
-                return "I'm sorry, but I don't have access to purchase order data right now."
-            search_results = self.search_documents(user_input, "po")
-        else:
-            # Use Gemini to interpret ambiguous queries
-            prompt = f"Determine if the following query is about Proforma Invoices or Purchase Orders: '{user_input}'. Respond with only 'proforma' or 'po'."
-            doc_type_response = self.query_gemini(prompt).strip().lower()
-            doc_type = "proforma" if "proforma" in doc_type_response else "po"
-
-            # Check if we have the required index
-            if (doc_type == "proforma" and not self.proforma_index) or (doc_type == "po" and not self.po_index):
-                return f"I've determined your question is about {doc_type}, but I don't have access to that data right now."
-
-            search_results = self.search_documents(user_input, doc_type)
-
-        # Construct a prompt for Gemini to generate a natural response
-        context = "\n".join(search_results)
-        prompt = (
-            f"You are a helpful assistant for a sales team. Based on the following document excerpts, "
-            f"answer the query: '{user_input}'. If the information is insufficient, say so clearly.\n\n"
-            f"Document excerpts:\n{context}"
+            }
         )
-        response = self.query_gemini(prompt)
-        return response
+
+    def _create_prompt(self, doc_type):
+        """Generate document-specific prompt"""
+        return PromptTemplate(
+            template=SALES_PROMPT_TEMPLATE,
+            input_variables=["context", "question"],
+            partial_variables={
+                "doc_type": doc_type.upper(),
+                **PROMPT_CONFIG.get(doc_type, {})
+            }
+        )
 
 
+# --- Streamlit Interface ---
 def main():
-    """Main function to run the chatbot"""
-    print("Initializing Sales Chatbot...")
-    try:
-        chatbot = SalesChatbot()
-        print("Sales Chatbot: How can I assist you today? (Type 'exit' to quit)")
+    st.title("Sales Document Assistant")
 
-        while True:
-            try:
-                user_input = input("You: ").strip()
-                if not user_input:
-                    continue
+    query = st.text_input("Ask about documents:",
+                          placeholder="e.g. 'Payment terms for INV-2024-789'")
 
-                if user_input.lower() in ("exit", "quit", "bye"):
-                    print("Sales Chatbot: Goodbye!")
-                    break
+    if query:
+        try:
+            rag_system = SalesRAGSystem()
 
-                response = chatbot.process_query(user_input)
-                print(f"Sales Chatbot: {response}")
+            doc_type = detect_document_type(query)
+            processed_query = rag_system.query_transform(query, doc_type)
 
-            except EOFError:
-                print("\nInput terminated. Exiting...")
-                break
-            except KeyboardInterrupt:
-                print("\nSales Chatbot: Session terminated by user. Goodbye!")
-                break
-            except Exception as e:
-                logging.error(f"Error in chat loop: {str(e)}")
-                print("Sales Chatbot: I encountered an error. Please try again.")
+            pipeline = rag_system.create_pipeline(doc_type)
+            result = pipeline.invoke({"query": processed_query})
 
-    except Exception as e:
-        logging.error(f"Failed to initialize chatbot: {str(e)}")
-        print("Failed to initialize the Sales Chatbot. Check logs for details.")
+            # Response validation
+            response = result["result"]
+            if not any(term in response for term in ["USD", "clause", "document"]):
+                response += "\n\n*Partial information - verify original document*"
+
+            # Display results
+            st.subheader(f"{doc_type.upper()} Analysis")
+            st.markdown(response)
+
+            with st.expander("Source References"):
+                for doc in result["source_documents"]:
+                    source = doc.metadata.get('source', 'Unknown')
+                    st.caption(f"From: {os.path.basename(source)}")
+                    st.text(doc.page_content[:400] + "...")
+
+            # Audit logging
+            logger.info(f"""
+                Document Type: {doc_type}
+                Original Query: {query}
+                Enhanced Query: {processed_query}
+                Response: {response[:300]}...
+            """)
+
+        except Exception as e:
+            st.error("Analysis failed. Please try again.")
+            logger.error(f"Query failure: {str(e)}")
 
 
 if __name__ == "__main__":
